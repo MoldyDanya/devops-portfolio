@@ -71,7 +71,7 @@ jobs:
     steps:
     - name: Display Run Information
       run: |
-        echo "# Unity Matrix Build Configuration" >> $GITHUB_STEP_SUMMARY
+        echo "# Unity Build Configuration" >> $GITHUB_STEP_SUMMARY
         echo "## Input Parameters" >> $GITHUB_STEP_SUMMARY
         echo "- Android: ${{ inputs.android_build_type }}" >> $GITHUB_STEP_SUMMARY
         echo "- iOS: ${{ inputs.ios_build_type }}" >> $GITHUB_STEP_SUMMARY
