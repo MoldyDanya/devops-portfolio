@@ -1,0 +1,20 @@
+name: 'Get Version from Git Tags'
+description: 'Calculate version from git tags and commit count'
+outputs:
+  version:
+    description: 'Calculated version'
+    value: ${{ steps.calculate-version.outputs.version }}
+  tag_version:
+    description: 'Base tag version'
+    value: ${{ steps.calculate-version.outputs.tag_version }}
+  commit_count:
+    description: 'Number of commits after tag'
+    value: ${{ steps.calculate-version.outputs.commit_count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Calculate version
+      id: calculate-version
+      shell: bash
+      run: bash ${{ github.action_path }}/get-version.sh

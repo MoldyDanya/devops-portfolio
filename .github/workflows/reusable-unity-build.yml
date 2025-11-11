@@ -1,0 +1,237 @@
+name: Reusable Unity Build
+run-name: ${{ inputs.platform }} Unity Build
+          ${{ inputs.upload_build && ' | Artifact' || '' }}
+          ${{ inputs.export_debug_symbols && ' | dSYM' || '' }}
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: 'Target platform (Android or iOS)'
+        type: string
+        required: true
+      branch_name:
+        type: string
+        required: true
+      commit_hash:
+        type: string
+      build_type:
+        description: 'Build type for Android (AAB or APK)'
+        type: string
+        default: AAB
+      upload_build:
+        description: 'Upload Build to artifacts'
+        type: boolean
+        default: true
+      export_debug_symbols:
+        type: boolean
+        default: true
+      deploy_to_store:
+        description: 'Deploy to store (affects build settings)'
+        type: boolean
+        default: false
+      deploy_track:
+        description: 'Deploy track (internal/beta)'
+        type: string
+        default: internal
+      development_build:
+        description: 'Enable development build with debug symbols and profiler'
+        type: boolean
+        default: false
+      clean_build:
+        description: 'Skip cache restore and force clean build'
+        type: boolean
+        default: false
+    outputs:
+      build_version:
+        description: 'Built application version'
+        value: ${{ jobs.build.outputs.build_version }}
+      version_code:
+        description: 'Android version code (Android only)'
+        value: ${{ jobs.build.outputs.version_code }}
+      exit_code:
+        description: 'Build exit code'
+        value: ${{ jobs.build.outputs.exit_code }}
+      commit:
+        description: 'Commit hash used for build'
+        value: ${{ jobs.build.outputs.commit }}
+      branch:
+        description: 'Branch used for build'
+        value: ${{ jobs.build.outputs.branch }}
+
+jobs:
+  build:
+    name: Build ${{ inputs.platform }}
+    runs-on: 
+      - self-hosted
+      - ${{ github.event.repository.name }}
+      - build
+    concurrency:
+      group: ${{ inputs.platform }}-build
+      cancel-in-progress: false
+    
+    outputs:
+      build_version: ${{ steps.unity_build.outputs.buildVersion }}
+      version_code: ${{ inputs.platform == 'Android' && steps.unity_build.outputs.androidVersionCode || '' }}
+      exit_code: ${{ steps.unity_build.outputs.engineExitCode }}
+      commit: ${{ github.sha }}
+      branch: ${{ github.ref_name }}
+    
+    env:
+      SERVUSERNAME: ${{ vars.RUNNER_USERNAME }}
+      GOOGLE_PLAY_KEY_FILE: ${{ secrets.GOOGLE_PLAY_KEY_FILE }}
+      ANDROID_PACKAGE_NAME: ${{ secrets.ANDROID_PACKAGE_NAME }}
+    
+    steps:
+      - uses: FraBle/clean-after-action@v2
+
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/actions
+            .github/scripts
+            fastlane
+
+      - name: Checkout project
+        uses: ./.github/actions/checkout-project
+        with:
+          branch_name: ${{ inputs.branch_name }}
+          commit_hash: ${{ inputs.commit_hash }}
+
+      # Platform-specific secrets check
+      - name: Platform Secrets Check
+        uses: ./.github/actions/platform-secrets-check
+        with:
+          platform: ${{ inputs.platform }}
+
+      - name: Unity Cache
+        uses: ./.github/actions/unity-cache
+        with:
+          platform: ${{ inputs.platform == 'Android' && 'android' || 'ios' }}
+          repository: ${{ github.repository }}
+          branch: ${{ inputs.branch_name }}
+          runner_username: ${{ vars.RUNNER_USERNAME }}
+          max_caches: ${{ vars.UNITY_CACHE_MAX_COUNT }}
+          max_age_days: ${{ vars.UNITY_CACHE_MAX_AGE_DAYS }}
+          clean_build: ${{ inputs.clean_build }}
+
+      # Platform-specific project settings
+      - name: Platform Project Settings
+        uses: ./.github/actions/platform-project-settings
+        with:
+          platform: ${{ inputs.platform }}
+          deploy_to_store: ${{ inputs.deploy_to_store }}
+          android_build_type: ${{ inputs.build_type }}
+
+      # Platform-specific define symbols
+      - name: Platform Define Symbols
+        uses: ./.github/actions/platform-define-symbols
+        with:
+          platform: ${{ inputs.platform }}
+          export_debug_symbols: ${{ inputs.export_debug_symbols }}
+          development_build: ${{ inputs.development_build }}
+
+      # Platform-specific authentication setup
+      - name: Platform Authentication Setup
+        uses: ./.github/actions/platform-auth-setup
+        with:
+          platform: ${{ inputs.platform }}
+      
+      - name: Get Version
+        id: get_version
+        uses: ./.github/actions/get-version
+
+      # Platform-specific version calculation (only for store deployments)
+      - name: Platform Version Calculation
+        if: inputs.deploy_to_store == true
+        id: version_calc
+        uses: ./.github/actions/platform-version-calculation
+        env:
+          # Android secrets
+          GOOGLE_PLAY_KEY_FILE: ${{ inputs.platform == 'Android' && env.GOOGLE_PLAY_KEY_FILE || '' }}
+          ANDROID_PACKAGE_NAME: ${{ inputs.platform == 'Android' && env.ANDROID_PACKAGE_NAME || '' }}
+          # iOS secrets
+          APPSTORE_KEY_ID: ${{ inputs.platform == 'iOS' && secrets.APPSTORE_KEY_ID || '' }}
+          APPSTORE_ISSUER_ID: ${{ inputs.platform == 'iOS' && secrets.APPSTORE_ISSUER_ID || '' }}
+          APPSTORE_P8: ${{ inputs.platform == 'iOS' && secrets.APPSTORE_P8 || '' }}
+          IOS_BUNDLE_ID: ${{ inputs.platform == 'iOS' && secrets.IOS_BUNDLE_ID || '' }}
+        with:
+          platform: ${{ inputs.platform }}
+          version: ${{ steps.get_version.outputs.version }}
+          deploy_track: ${{ inputs.deploy_track }}
+
+      # Platform-specific Unity build parameters
+      - name: Platform Unity Build Parameters
+        id: build_params
+        uses: ./.github/actions/platform-unity-build-params
+        with:
+          platform: ${{ inputs.platform }}
+          android_build_type: ${{ inputs.build_type }}
+          android_version_code: ${{ steps.version_calc.outputs.android_version_code }}
+          version: ${{ steps.get_version.outputs.version }}
+          
+      # Create custom build script with logging configuration
+      - name: Create Custom Build Script
+        run: |
+          mkdir -p Assets/Editor
+          cp .github/scripts/CustomBuildScript.cs Assets/Editor/
+          
+      # Unity Build
+      - uses: game-ci/unity-builder@v4
+        id: unity_build
+        env:
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+        with:
+          targetPlatform: ${{ steps.build_params.outputs.target_platform }}
+          chownFilesTo: ${{ env.SERVUSERNAME }}
+          versioning: Custom
+          allowDirtyBuild: true
+          runAsHostUser: true
+          version: ${{ (inputs.platform == 'iOS' && inputs.deploy_to_store && steps.version_calc.outputs.ios_final_version) || steps.get_version.outputs.version }}
+          # Android-specific parameters (will be empty for iOS)
+          customParameters: ${{ inputs.development_build && '-development' || '-disablelogs' }}${{ inputs.export_debug_symbols && ' -debugsymbols' || '' }}
+          buildMethod: UnityBuilderAction.CustomBuildScript.Build
+          androidExportType: ${{ steps.build_params.outputs.android_export_type }}
+          androidKeystoreName: ${{ inputs.platform == 'Android' && 'android-keystore' || '' }}
+          androidKeystoreBase64: ${{ inputs.platform == 'Android' && secrets.ANDROID_KEYSTORE_BASE64 || '' }}
+          androidKeystorePass: ${{ inputs.platform == 'Android' && secrets.ANDROID_KEYSTORE_PASS || '' }}
+          androidKeyaliasName: ${{ inputs.platform == 'Android' && secrets.ANDROID_KEYALIAS_NAME || '' }}
+          androidKeyaliasPass: ${{ inputs.platform == 'Android' && secrets.ANDROID_KEYALIAS_PASS || '' }}
+          androidTargetSdkVersion: ${{ inputs.platform == 'Android' && 'AndroidApiLevel34' || '' }}
+          androidVersionCode: ${{ inputs.platform == 'Android' && steps.version_calc.outputs.android_version_code || '' }}
+      
+      - name: Fix Permissions
+        uses: ./.github/actions/fix-permissions
+        with:
+          username: ${{ env.SERVUSERNAME }}
+          workspace: ${{ github.workspace }}
+
+      # Platform-specific post-build actions
+      - name: Platform Post-Build Actions
+        uses: ./.github/actions/platform-post-build
+        with:
+          platform: ${{ inputs.platform }}
+
+      - name: Build Information Summary
+        run: |
+          ACTUAL_COMMIT=$(git rev-parse HEAD)
+          echo "# ${{ inputs.platform }} Build Information" >> $GITHUB_STEP_SUMMARY
+          echo "## Build Details" >> $GITHUB_STEP_SUMMARY
+          echo "- Build Version: ${{ steps.unity_build.outputs.buildVersion }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.platform }}" == "Android" ]; then
+            echo "- Version Code: ${{ steps.unity_build.outputs.androidVersionCode }}" >> $GITHUB_STEP_SUMMARY
+            echo "- Build Type: ${{ inputs.build_type }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "- Branch: ${{ inputs.branch_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit Hash: $ACTUAL_COMMIT" >> $GITHUB_STEP_SUMMARY
+          echo "- Build Status: ${{ steps.unity_build.outputs.engineExitCode == 0 && 'Success' || 'Failed' }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Build Artifact
+        if: inputs.upload_build
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ inputs.platform }}
+          path: build/${{ inputs.platform }}
+          retention-days: 7

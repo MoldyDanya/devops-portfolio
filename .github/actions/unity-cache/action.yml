@@ -1,0 +1,47 @@
+name: 'Unity Library Cache'
+description: 'Cache Unity Library for faster builds'
+inputs:
+  platform:
+    description: 'Target platform (android, ios, etc.)'
+    required: true
+  repository:
+    description: 'Repository name (github.repository)'
+    required: true
+  branch:
+    description: 'Branch name (github.ref_name)'
+    required: false
+    default: 'master'
+  cache_base_path:
+    description: 'Base path for cache storage'
+    required: false
+    default: '/home/runner/actions-cache'
+  runner_username:
+    description: 'Runner username for cache path construction'
+    required: false
+    default: 'runner'
+  skip-save:
+    description: 'Skip saving cache at the end'
+    required: false
+    default: 'false'
+  max_caches:
+    description: 'Maximum number of cache files to keep per platform'
+    required: false
+    default: '7'
+  max_age_days:
+    description: 'Maximum age in days for cache files before cleanup'
+    required: false
+    default: '7'
+  clean_build:
+    description: 'Skip cache restore and force clean build'
+    required: false
+    default: 'false'
+
+outputs:
+  cache-hit:
+    description: 'Whether cache was restored (true/false/fallback)'
+
+runs:
+  using: 'node20'
+  main: 'index.js'
+  post: 'save.js'
+  post-if: 'always()'

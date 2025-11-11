@@ -1,0 +1,49 @@
+name: 'Upload to Google Play Internal App Sharing'
+description: 'Upload Android AAB to Google Play Internal App Sharing using direct HTTP API'
+inputs:
+  aab-path:
+    description: 'Path to the AAB file'
+    required: true
+  package-name:
+    description: 'Android package name'
+    required: true
+  service-account-json:
+    description: 'Google Play service account JSON content'
+    required: true
+outputs:
+  download-url:
+    description: 'Internal App Sharing download URL'
+    value: ${{ steps.upload.outputs.url }}
+  package-name:
+    description: 'Package name used for upload'
+    value: ${{ steps.upload.outputs.package_name }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Install required tools
+      shell: bash
+      run: |
+        if ! command -v jq &> /dev/null; then
+          sudo apt-get update
+          sudo apt-get install -y jq openssl curl
+        fi
+    
+    - name: Create service account file
+      shell: bash
+      run: |
+        echo '${{ inputs.service-account-json }}' > /tmp/service-account.json
+        echo "GOOGLE_PLAY_KEY_FILE_PATH=/tmp/service-account.json" >> $GITHUB_ENV
+    
+    - name: Upload to Internal App Sharing
+      id: upload
+      shell: bash
+      run: |
+        chmod +x ${{ github.action_path }}/upload-to-internal-sharing.sh
+        ${{ github.action_path }}/upload-to-internal-sharing.sh \
+          "${{ inputs.aab-path }}" \
+          "${{ inputs.package-name }}"
+    
+    - name: Cleanup
+      shell: bash
+      if: always()
+      run: rm -f /tmp/service-account.json

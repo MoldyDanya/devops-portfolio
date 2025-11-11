@@ -1,0 +1,119 @@
+name: Android deploy
+run-name: ${{ 'Android deploy:' }}
+          ${{inputs.deploy_track}}
+          ${{ ' | Release status:' }}
+          ${{ inputs.release_status }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      self_hosted:
+        description: 'Run on self-hosted runner'
+        type: boolean
+        default: false
+      deploy_track:
+        description: '🚀 Track to deploy'
+        type: choice
+        options:
+          - internal
+          - beta
+        default: internal
+      release_status:
+        description: '🚀 Release status for the build'
+        type: choice
+        options:
+          - draft
+          - completed
+        default: draft
+      use_default_changelog:
+        description: '🚀 Use default changelog'
+        type: boolean
+        default: false
+      export_debug_symbols:
+        description: '🚀 Export debug symbols'
+        type: boolean
+        default: true
+      specific_run_id:
+        description: 'Run ID to download artifact from (optional)'
+        type: string
+        required: false
+  workflow_call:
+    inputs:
+      self_hosted:
+        type: boolean
+        default: false
+      deploy_track:
+        type: string
+        default: internal
+      release_status:
+        type: string
+        default: draft
+      use_default_changelog:
+        type: boolean
+        default: false
+      export_debug_symbols:
+        type: boolean
+        default: true
+      specific_run_id:
+        type: string
+        required: false
+
+jobs:
+  deploy-to-play-store:
+    name: Deploy to Play Store
+    runs-on: ${{ inputs.self_hosted && 'self-hosted' || 'ubuntu-latest' }}
+    env:
+      SERVUSERNAME: ${{ vars.RUNNER_USERNAME }}
+      GOOGLE_PLAY_KEY_FILE: ${{ secrets.GOOGLE_PLAY_KEY_FILE }}
+      GOOGLE_PLAY_KEY_FILE_PATH: ${{ format('{0}/fastlane/google-fastlane.json', github.workspace) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/actions
+            fastlane
+        
+      - name: Install libffi
+        if: ${{ !inputs.self_hosted }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libffi-dev
+
+      - name: Download Android artifact
+        uses: ./.github/actions/download-build-artifact
+        with:
+          artifact-name: build-Android
+          destination-path: build/Android
+          workflow-filename: unity-build-matrix.yml
+          specific-run-id: ${{ inputs.specific_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Fastlane Directory
+        run: mkdir -p $(dirname "$GOOGLE_PLAY_KEY_FILE_PATH")
+
+      - name: Add Authentication
+        run: echo "$GOOGLE_PLAY_KEY_FILE" > $GOOGLE_PLAY_KEY_FILE_PATH
+
+      - name: Make dir and chown for fastlane
+        if: ${{ inputs.self_hosted }}
+        run: sudo mkdir -p /opt/hostedtoolcache && sudo chown -R ${{ env.SERVUSERNAME }}:${{ env.SERVUSERNAME }} /opt/hostedtoolcache
+
+      - name: Set up Fastlane
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 3.2
+          bundler-cache: true
+
+      - name: Upload to Google Play
+        uses: maierj/fastlane-action@v3.0.0
+        with:
+          lane: 'android ${{ inputs.deploy_track }}'
+        env:
+          RELEASE_STATUS: ${{ inputs.release_status }}
+          USE_DEFAULT_CHANGELOG: ${{ inputs.use_default_changelog }}
+          EXPORT_DEBUG_SYMBOLS: ${{ inputs.export_debug_symbols }}
+          FASTLANE_VERBOSE: "true"
+          ANDROID_BUILD_FILE_PATH: ${{ format('{0}/build/Android/Android.aab', github.workspace) }}
+          ANDROID_DEBUG_SYMBOLS_PATTERN: ${{ format('{0}/build/Android/*.symbols.zip', github.workspace) }}
+          ANDROID_PACKAGE_NAME: ${{ secrets.ANDROID_PACKAGE_NAME }}

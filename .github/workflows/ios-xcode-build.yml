@@ -1,0 +1,288 @@
+name: iOS Xcode Build & Deploy
+run-name: ${{'Xcode Build & Deploy'}}
+          ${{ inputs.deploy_to_store && ' | Deploy:' || '' }}
+          ${{ inputs.deploy_to_store && ' TestFlight' || '' }}
+          ${{ inputs.deploy_to_store && inputs.external_testers && ' | External group' || '' }}
+          ${{ inputs.upload_ipa && ' | Artifact' || '' }}
+          ${{ inputs.export_debug_symbols && ' | dSYM' || '' }}       
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload_ipa:
+        description: 'Upload IPA to artifacts' 
+        type: boolean
+        default: false
+      deploy_to_store:
+        description: '🚀 Deploy to App Store'
+        type: boolean
+        default: false
+      export_debug_symbols:
+        description: '🚀 Deploy DSYM'
+        type: boolean
+        default: true
+      use_default_changelog:
+        description: '🚀 Use default changelog'
+        type: boolean
+        default: false
+      external_testers:
+        description: '🚀 Share to external testers'
+        type: boolean
+        default: false
+      specific_run_id:
+        description: 'Run ID to download artifact from (optional)'
+        type: string
+        required: false
+  workflow_call:
+    inputs:
+      deploy_to_store:
+        type: boolean
+        default: true
+      export_debug_symbols:
+        type: boolean
+        default: true
+      use_default_changelog:
+        type: boolean
+        default: false
+      upload_ipa:
+        type: boolean
+        default: false
+      external_testers:
+        type: boolean
+        default: false
+      specific_run_id:
+        type: string
+        required: false
+
+jobs:
+  build-xcode:
+    name: ${{ format('Xcode {0}{1}', 
+      inputs.deploy_to_store && 'Build & Deploy' || 'Build',
+      inputs.upload_ipa && ' with IPA' || '') }}
+    runs-on: macos-14
+    env:
+      IOS_BUILD_PATH: ${{ format('{0}/build/iOS', github.workspace) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/actions
+            fastlane
+            Gemfile
+            Gemfile.lock
+
+      - name: Download iOS artifact
+        uses: ./.github/actions/download-build-artifact
+        with:
+          artifact-name: build-iOS
+          destination-path: build/iOS
+          workflow-filename: unity-build-matrix.yml
+          specific-run-id: ${{ inputs.specific_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        
+      - name: Configure Xcode
+        run: sudo xcode-select -switch /Applications/Xcode_16.1.app
+      
+      # - name: Cache CocoaPods
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: build/iOS/iOS/Pods
+      #     key: iOS-pods
+      
+      # - name: Cache Xcode Build
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: ~/Library/Developer/Xcode/DerivedData
+      #     key: iOS-xcode
+
+      - name: Setup Ruby
+        run: |
+          brew update
+          brew install ruby
+      
+      - name: Setup CocoaPods
+        run: |
+          echo "🍏 Setting up CocoaPods for AppLovin SDK integration..."
+          gem uninstall cocoapods -a -x || true
+          gem install cocoapods -v 1.16.2
+          pod --version
+          echo "✅ CocoaPods setup complete"
+
+      # - name: Install pod dependencies
+      #   run: |
+      #     cd build/iOS/iOS
+      #     ls -la
+      #     if [ -f Podfile ]; then
+      #       echo "Podfile found. Content:"
+      #       cat Podfile
+      #     else
+      #       echo "Error: Podfile not found"
+      #       exit 1
+      #     fi
+      #     pod install --repo-update --clean-install
+
+      - name: Patch AppsFlyer
+        run: |
+          sed -i '' '144s/.*/return ((BOOL(*)(id, SEL, UIApplication*, NSDictionary*, int(UIBackgroundFetchResult)))__original_didReceiveRemoteNotification_Imp)(self, _cmd, application, userInfo, nil);/' $IOS_BUILD_PATH/iOS/Libraries/AppsFlyer/Plugins/iOS/AppsFlyer+AppController.m
+
+      - name: ${{ inputs.deploy_to_store == true && 'Build and Deploy' || 'Build IPA' }}
+        id: xcode_build
+        env:
+          APPLE_CONNECT_EMAIL: ${{ secrets.APPLE_CONNECT_EMAIL }}
+          APPLE_DEVELOPER_EMAIL: ${{ secrets.APPLE_DEVELOPER_EMAIL }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MATCH_REPOSITORY: ${{ secrets.MATCH_REPOSITORY }}
+          MATCH_DEPLOY_KEY: ${{ secrets.MATCH_DEPLOY_KEY }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          APPSTORE_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          APPSTORE_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          APPSTORE_P8: ${{ secrets.APPSTORE_P8 }}
+          IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
+          PROJECT_NAME: ${{ vars.SAMPLE_PROJECT_NAME }}
+          USE_DEFAULT_CHANGELOG: ${{ inputs.use_default_changelog }}
+          EXPORT_DEBUG_SYMBOLS: ${{ inputs.export_debug_symbols }}
+        run: |
+          echo "🍏 === XCODE BUILD & APPLOVIN VALIDATION START ==="
+          echo "🍏 Build path: $IOS_BUILD_PATH"
+          
+          # Pre-build AppLovin validation
+          echo "🍏 === PRE-BUILD APPLOVIN VALIDATION ==="
+          echo "🔍 Checking for AppLovin SDK in Unity export..."
+          if [ -d "$IOS_BUILD_PATH/iOS/Pods" ]; then
+            echo "✅ Pods directory found"
+            ls -la "$IOS_BUILD_PATH/iOS/Pods" | grep -i applovin || echo "⚠️ AppLovin not found in Pods directory"
+          else
+            echo "❌ Pods directory not found at $IOS_BUILD_PATH/iOS/Pods"
+          fi
+          
+          # Check for Podfile
+          if [ -f "$IOS_BUILD_PATH/iOS/Podfile" ]; then
+            echo "✅ Podfile found"
+            echo "📋 Podfile contents:"
+            cat "$IOS_BUILD_PATH/iOS/Podfile"
+            echo "🔍 Searching for AppLovin in Podfile:"
+            grep -i applovin "$IOS_BUILD_PATH/iOS/Podfile" || echo "⚠️ AppLovin not explicitly found in Podfile"
+          else
+            echo "❌ Podfile not found"
+          fi
+          
+          # Check for AppLovin-Settings.plist
+          if [ -f "$IOS_BUILD_PATH/iOS/AppLovin-Settings.plist" ]; then
+            echo "✅ AppLovin-Settings.plist found"
+            echo "📋 AppLovin-Settings.plist contents:"
+            cat "$IOS_BUILD_PATH/iOS/AppLovin-Settings.plist"
+          else
+            echo "⚠️ AppLovin-Settings.plist not found"
+          fi
+          
+          eval "$(ssh-agent -s)"
+          ssh-add - <<< "${MATCH_DEPLOY_KEY}"
+          find $IOS_BUILD_PATH -type f -name "**.sh" -exec chmod +x {} \;
+          find $IOS_BUILD_PATH -type f -iname "usymtool" -exec chmod +x {} \;
+          find $IOS_BUILD_PATH -type f -iname "usymtoolarm64" -exec chmod +x {} \;
+
+          bundle install
+
+          if [[ "${{ inputs.deploy_to_store }}" == "true" ]]; then
+            bundle exec fastlane ios beta \
+              distribute_external:${{ inputs.external_testers }} \
+              external_group_name:${{ vars.IOS_EXTERNAL_GROUP_NAME }} --verbose
+          else
+            bundle exec fastlane ios build --verbose
+          fi
+
+      - name: Final AppLovin Validation & Build Summary
+        if: always()
+        run: |
+          echo "🍏 === FINAL APPLOVIN VALIDATION & BUILD SUMMARY ==="
+          BUILD_VERSION="${{ steps.xcode_build.outputs.version }}"
+          BUILD_NUMBER="${{ steps.xcode_build.outputs.build_number }}"
+          
+          # Check for generated IPA files and validate AppLovin presence
+          echo "🔍 Searching for generated IPA files..."
+          find $GITHUB_WORKSPACE -name "*.ipa" -type f 2>/dev/null | while read ipa_file; do
+            echo "📱 Found IPA: $ipa_file"
+            echo "📊 IPA size: $(ls -lh "$ipa_file" | awk '{print $5}')"
+            
+            # Extract IPA and check for AppLovin
+            temp_dir="/tmp/final_validation_$(date +%s)"
+            mkdir -p "$temp_dir"
+            cd "$temp_dir"
+            unzip -q "$ipa_file" 2>/dev/null || echo "⚠️ Failed to extract IPA"
+            
+            if [ -d "Payload" ]; then
+              app_dir=$(find Payload -name "*.app" -type d | head -1)
+              if [ -n "$app_dir" ]; then
+                echo "📱 App bundle: $app_dir"
+                
+                # Final AppLovin framework check
+                if [ -d "$app_dir/Frameworks" ]; then
+                  echo "📦 Frameworks in final app:"
+                  ls -la "$app_dir/Frameworks/" | grep -E '\.(framework|dylib)$' || echo "No frameworks found"
+                  
+                  if ls "$app_dir/Frameworks/"*AppLovin* 1> /dev/null 2>&1; then
+                    echo "✅ SUCCESS: AppLovin frameworks found in final app bundle!"
+                  else
+                    echo "❌ CRITICAL ERROR: AppLovin frameworks MISSING from final app bundle!"
+                    echo "This is why the app crashes with: Library not loaded: @rpath/AppLovinSDK.framework/AppLovinSDK"
+                  fi
+                else
+                  echo "❌ No Frameworks directory in app bundle"
+                fi
+                
+                # Check Info.plist final state
+                if [ -f "$app_dir/Info.plist" ]; then
+                  echo "📋 Checking final Info.plist for AppLovin configuration..."
+                  if plutil -p "$app_dir/Info.plist" | grep -q "GADApplicationIdentifier"; then
+                    echo "✅ GADApplicationIdentifier found in final Info.plist"
+                  else
+                    echo "⚠️ GADApplicationIdentifier missing from final Info.plist"
+                  fi
+                fi
+              fi
+            fi
+            
+            rm -rf "$temp_dir"
+          done
+          
+          # Write to step summary
+          echo "# iOS Xcode Build Information" >> $GITHUB_STEP_SUMMARY
+          echo "## Build Details" >> $GITHUB_STEP_SUMMARY
+          echo "- Build Version: $BUILD_VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "- Build Number: $BUILD_NUMBER" >> $GITHUB_STEP_SUMMARY
+          echo "- Branch: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Build Status: ${{ steps.xcode_build.outputs.engineExitCode == 0 && 'Success' || 'Failed' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## AppLovin SDK Status" >> $GITHUB_STEP_SUMMARY
+          echo "Check the build logs above for detailed AppLovin integration status." >> $GITHUB_STEP_SUMMARY
+          echo "🔍 Search for 'APPLOVIN' in logs to find all validation points." >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload IPA
+        if: ${{ inputs.upload_ipa }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-ipa
+          path: ${{ github.workspace }}/**/*.ipa
+          retention-days: 7
+
+      - name: Upload dSYM Files
+        if: inputs.export_debug_symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-debug-symbols
+          path: |
+            ${{ github.workspace }}/**/*.dSYM
+            ${{ github.workspace }}/**/*.dSYM.zip
+          retention-days: 7
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcode-logs
+          path: |
+            ~/Library/Logs/gym/*.log
+            ~/Library/Logs/xcreports/*
+          retention-days: 7

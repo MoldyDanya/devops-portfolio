@@ -1,0 +1,95 @@
+name: 'Platform Version Calculation'
+description: 'Calculate platform-specific version codes'
+inputs:
+  platform:
+    description: 'Target platform (Android or iOS)'
+    required: true
+  version:
+    description: 'Base version string'
+    required: true
+  deploy_track:
+    description: 'Deploy track for Android (internal/beta)'
+    required: false
+    default: 'internal'
+
+outputs:
+  android_version_code:
+    description: 'Calculated Android version code'
+    value: ${{ steps.android_version.outputs.version_code }}
+  android_version_name:
+    description: 'Calculated Android version name'
+    value: ${{ steps.android_version.outputs.version_name }}
+  ios_final_version:
+    description: 'Final iOS version after App Store check'
+    value: ${{ steps.ios_version.outputs.final_version }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Ruby and Bundle
+      shell: bash
+      run: |
+        if [ "${{ inputs.platform }}" == "iOS" ]; then
+          echo "🔧 Setting up Ruby and Bundle for iOS store version check..."
+          
+          # Configure gem to install to user directory
+          export GEM_HOME="$HOME/.gem"
+          export PATH="$GEM_HOME/bin:$PATH"
+          mkdir -p "$GEM_HOME/bin"
+          
+          echo "GEM_HOME=$HOME/.gem" >> $GITHUB_ENV
+          echo "$HOME/.gem/bin" >> $GITHUB_PATH
+          
+          # Install bundler to user directory
+          gem install bundler --user-install
+          
+          # Set bundle path to user directory  
+          bundle config set --local path "$HOME/.bundle"
+          
+          if [ -f Gemfile ]; then
+            bundle install
+          fi
+        fi
+        
+    - name: Setup Android Google Play Key
+      if: inputs.platform == 'Android'
+      shell: bash
+      run: |
+        echo "🔧 Setting up Google Play service account key..."
+        echo '${{ env.GOOGLE_PLAY_KEY_FILE }}' > /tmp/google_play_key.json
+        echo "GOOGLE_PLAY_KEY_FILE_PATH=/tmp/google_play_key.json" >> $GITHUB_ENV
+        
+    - name: Calculate Android Version Code
+      if: inputs.platform == 'Android'
+      id: android_version
+      uses: maierj/fastlane-action@v3.0.0
+      with:
+        lane: 'get_android_version_code'
+        options: '{ "version": "${{ inputs.version }}", "track": "${{ inputs.deploy_track }}" }'
+        
+    - name: Calculate iOS Version
+      if: inputs.platform == 'iOS'
+      id: ios_version
+      uses: maierj/fastlane-action@v3.0.0
+      with:
+        lane: 'get_ios_final_version'
+        options: '{ "version": "${{ inputs.version }}" }'
+        
+    - name: Version Conflict Alert
+      if: inputs.platform == 'iOS' && inputs.version != steps.ios_version.outputs.final_version
+      shell: bash
+      run: |
+        echo "::warning title=VERSION CONFLICT::iOS version auto-incremented from ${{ inputs.version }} to ${{ steps.ios_version.outputs.final_version }}. Update git tags!"
+        echo "# 🚨🚨🚨 VERSION CONFLICT ALERT 🚨🚨🚨" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## ⚠️ iOS Version Auto-Incremented Due to App Store Conflict!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| 📦 **Git Version** | \`${{ inputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| 🍎 **iOS Final Version** | \`${{ steps.ios_version.outputs.final_version }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📝 Action Required:" >> $GITHUB_STEP_SUMMARY
+        echo "🏷️ **UPDATE GIT TAGS** to match the new iOS version!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "---" >> $GITHUB_STEP_SUMMARY

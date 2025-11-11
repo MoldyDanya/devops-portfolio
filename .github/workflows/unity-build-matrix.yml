@@ -1,0 +1,169 @@
+name: ⚡Run Unity Build Pipeline (🤖 + 🍏)
+run-name: ${{ format('{0}{1}{2}', inputs.branch_name, !contains(inputs.android_build_type, 'Skip') && format(' | Android ({0})', inputs.android_build_type) || '', !contains(inputs.ios_build_type, 'Skip') && format(' | iOS ({0})', inputs.ios_build_type) || '') }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        type: string
+        description: 'Branch name to build from'
+        required: true
+      commit_hash:
+        description: 'Commit hash to build from (optional)'
+        type: string
+      android_build_type:
+        description: '🤖 Android build workflow'
+        type: choice
+        options:
+          - 'Skip Android'
+          - 'APK (Development)'
+          - 'AAB + IAS (Development)'
+          - 'AAB + Deploy Internal'
+          - 'AAB + Deploy Beta'
+          - 'AAB + IAS + Deploy Internal'
+          - 'AAB + IAS + Deploy Beta'
+        default: 'APK (Development)'
+      android_release_status:
+        description: '🤖 Android release status (when deploying to Play Store)'
+        type: choice
+        options:
+          - 'Draft'
+          - 'Published'
+        default: 'Draft'
+      ios_build_type:
+        description: '🍏 iOS build workflow'
+        type: choice
+        options:
+          - 'Skip iOS'
+          - 'Build Only'
+          - 'Build + Deploy Internal'
+          - 'Build + Deploy Internal (Development)'
+          - 'Build + Deploy Internal + External'
+          - 'Build + Deploy Internal + External (Development)'
+        default: 'Build Only'
+      clean_build:
+        description: '🧹 Clean Build (skip cache restore)'
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      branch_name:
+        type: string
+        required: true
+      commit_hash:
+        type: string
+      android_build_type:
+        type: string
+        default: 'APK (Development)'
+      android_release_status:
+        type: string
+        default: 'Draft'
+      ios_build_type:
+        type: string
+        default: 'Build Only'
+      clean_build:
+        type: boolean
+        default: false
+
+jobs:
+  show-run-info:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Display Run Information
+      run: |
+        echo "# Unity Matrix Build Configuration" >> $GITHUB_STEP_SUMMARY
+        echo "## Input Parameters" >> $GITHUB_STEP_SUMMARY
+        echo "- Android: ${{ inputs.android_build_type }}" >> $GITHUB_STEP_SUMMARY
+        echo "- iOS: ${{ inputs.ios_build_type }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Branch Name: ${{ inputs.branch_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Commit Hash: ${{ inputs.commit_hash || 'Not specified' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Android Release Status: ${{ inputs.android_release_status }}" >> $GITHUB_STEP_SUMMARY
+
+  start-instance:
+    name: Start EC2 Instance
+    uses: ./.github/workflows/manage-ec2.yml
+    with:
+      action: start
+    secrets: inherit
+
+  build-android:
+    if: ${{ !contains(inputs.android_build_type, 'Skip') }}
+    needs: [start-instance]
+    uses: ./.github/workflows/reusable-unity-build.yml
+    with:
+      platform: Android
+      branch_name: ${{ inputs.branch_name }}
+      commit_hash: ${{ inputs.commit_hash }}
+      build_type: ${{ contains(inputs.android_build_type, 'AAB') && 'AAB' || 'APK' }}
+      upload_build: true
+      export_debug_symbols: true
+      deploy_to_store: ${{ contains(inputs.android_build_type, 'Deploy') }}
+      deploy_track: ${{ contains(inputs.android_build_type, 'Internal') && 'internal' || 'beta' }}
+      development_build: ${{ contains(inputs.android_build_type, 'Development') }}
+      clean_build: ${{ inputs.clean_build }}
+    secrets: inherit
+
+  build-ios:
+    if: ${{ !contains(inputs.ios_build_type, 'Skip') }}
+    needs: [start-instance]
+    uses: ./.github/workflows/reusable-unity-build.yml
+    with:
+      platform: iOS
+      branch_name: ${{ inputs.branch_name }}
+      commit_hash: ${{ inputs.commit_hash }}
+      upload_build: true
+      export_debug_symbols: true
+      deploy_to_store: ${{ contains(inputs.ios_build_type, 'Deploy') }}
+      development_build: ${{ contains(inputs.ios_build_type, 'Development') }}
+      clean_build: ${{ inputs.clean_build }}
+    secrets: inherit
+
+  # Deploy jobs - only run after successful builds
+  deploy-android:
+    if: contains(inputs.android_build_type, 'Deploy') && !contains(inputs.android_build_type, 'Skip')
+    needs: [build-android]
+    uses: ./.github/workflows/android-deploy.yml
+    with:
+      self_hosted: false
+      deploy_track: ${{ contains(inputs.android_build_type, 'Internal') && 'internal' || 'beta' }}
+      release_status: ${{ inputs.android_release_status == 'Published' && 'completed' || 'draft' }}
+      use_default_changelog: true
+      export_debug_symbols: true
+      specific_run_id: ${{ github.run_id }}
+    secrets: inherit
+
+  process-ios:
+    if: (contains(inputs.ios_build_type, 'Build Only') || contains(inputs.ios_build_type, 'Deploy')) && !contains(inputs.ios_build_type, 'Skip')
+    needs: [build-ios]
+    uses: ./.github/workflows/ios-xcode-build.yml
+    with:
+      deploy_to_store: ${{ contains(inputs.ios_build_type, 'Deploy') }}
+      use_default_changelog: true
+      external_testers: ${{ contains(inputs.ios_build_type, 'External') }}
+      upload_ipa: ${{ contains(inputs.ios_build_type, 'Build Only') }}
+      export_debug_symbols: true
+    secrets: inherit
+
+  upload-android-ias:
+    if: contains(inputs.android_build_type, 'IAS') && !contains(inputs.android_build_type, 'Skip')
+    needs: [build-android]
+    uses: ./.github/workflows/android-ias.yml
+    with:
+      self_hosted: false
+      generate_ias_link: true
+      specific_run_id: ${{ github.run_id }}
+    secrets: inherit
+
+  collect-build-info:
+    needs: [build-android, build-ios]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - name: Build Information Summary
+      run: |
+        echo "# Unity Build Results" >> $GITHUB_STEP_SUMMARY
+        echo "- Android: ${{ inputs.android_build_type }}" >> $GITHUB_STEP_SUMMARY
+        echo "- iOS: ${{ inputs.ios_build_type }}" >> $GITHUB_STEP_SUMMARY            
+        echo "- Workflow Run ID: ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Workflow Trigger: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Run Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY

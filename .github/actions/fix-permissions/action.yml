@@ -1,0 +1,23 @@
+name: 'Fix Repository Permissions'
+description: 'Sets correct ownership and permissions for the repository files'
+inputs:
+  username:
+    description: 'Username to set as owner'
+    required: true
+  workspace:
+    description: 'Path to the workspace'
+    required: true
+    default: ${{ github.workspace }}
+  permission:
+    description: 'Permission mode to set (e.g. 755)'
+    required: false
+    default: '755'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Fix permissions
+      shell: bash
+      run: |
+        sudo chown -R ${{ inputs.username }}:${{ inputs.username }} ${{ inputs.workspace }}
+        sudo chmod -R ${{ inputs.permission }} ${{ inputs.workspace }}

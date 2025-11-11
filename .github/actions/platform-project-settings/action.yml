@@ -1,0 +1,56 @@
+name: 'Platform Project Settings'
+description: 'Configure Unity project settings based on platform'
+inputs:
+  platform:
+    description: 'Target platform (Android or iOS)'
+    required: true
+  deploy_to_store:
+    description: 'Whether deploying to store'
+    required: false
+    default: 'false'
+  android_build_type:
+    description: 'Android build type (AAB or APK)'
+    required: false
+    default: 'AAB'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Modify Project Settings
+      shell: bash
+      run: |
+        SETTINGS_FILE="ProjectSettings/ProjectSettings.asset"
+        
+        if [ ! -f "$SETTINGS_FILE" ]; then
+          echo "Error: $SETTINGS_FILE not found!"
+          exit 1
+        fi
+    
+        # Android-specific APKExpansionFiles setting
+        if [ "${{ inputs.platform }}" == "Android" ]; then
+          if [ "${{ inputs.deploy_to_store }}" == "true" ] || [ "${{ inputs.android_build_type }}" == "AAB" ]; then
+            if grep -q "APKExpansionFiles: 0" "$SETTINGS_FILE"; then
+              echo "Enabling Split Application Binary (APKExpansionFiles: 0 -> 1)"
+              sed -i 's/APKExpansionFiles: 0/APKExpansionFiles: 1/g' "$SETTINGS_FILE"
+            else
+              echo "Split Application Binary already enabled (APKExpansionFiles: 1)"
+            fi
+          else
+            if grep -q "APKExpansionFiles: 1" "$SETTINGS_FILE"; then
+              echo "Disabling Split Application Binary (APKExpansionFiles: 1 -> 0)"
+              sed -i 's/APKExpansionFiles: 1/APKExpansionFiles: 0/g' "$SETTINGS_FILE"
+            else
+              echo "Split Application Binary already disabled (APKExpansionFiles: 0)"
+            fi
+          fi
+        fi
+    
+        # Unity Splash Screen setting (common for both platforms)
+        if grep -q "m_ShowUnitySplashScreen: 1" "$SETTINGS_FILE"; then
+          echo "Disabling Unity Splash Screen (m_ShowUnitySplashScreen: 1 -> 0)"
+          sed -i 's/m_ShowUnitySplashScreen: 1/m_ShowUnitySplashScreen: 0/g' "$SETTINGS_FILE"
+        else
+          echo "Unity Splash Screen already disabled (m_ShowUnitySplashScreen: 0)"
+        fi
+        
+        echo "✅ Project settings configured for ${{ inputs.platform }}"

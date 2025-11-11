@@ -1,0 +1,27 @@
+name: 'iOS A/B Test Icons Setup'
+description: 'Setup A/B testing for iOS app icons'
+inputs:
+  icons_folder_path:
+    description: 'Path to AB test icons folder'
+    required: false
+    default: 'Assets/AppIcons/ABTest'
+  xcode_project_dir:
+    description: 'Path to Xcode project directory'
+    required: false
+    default: 'build/iOS/iOS'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install imagemagick
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y imagemagick
+
+    - name: Setup A/B testing for app icons
+      shell: bash
+      env:
+        ICONS_FOLDER_PATH: ${{ inputs.icons_folder_path }}
+        XCODE_PROJECT_DIR: ${{ inputs.xcode_project_dir }}
+      run: bash ${{ github.action_path }}/setup-ab-icons.sh

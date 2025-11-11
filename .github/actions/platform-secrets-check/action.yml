@@ -1,0 +1,25 @@
+name: 'Platform Secrets Check'
+description: 'Check platform-specific secrets and environment setup'
+inputs:
+  platform:
+    description: 'Target platform (Android or iOS)'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check Android secrets
+      if: inputs.platform == 'Android'
+      shell: bash
+      run: |
+        if [ -z "$GOOGLE_PLAY_KEY_FILE" ]; then
+          echo "Error: GOOGLE_PLAY_KEY_FILE secret is not set. Workflow cannot proceed."
+          exit 1
+        fi
+        echo "✅ Android secrets verified"
+    
+    - name: iOS secrets check
+      if: inputs.platform == 'iOS'
+      shell: bash
+      run: |
+        echo "✅ iOS platform - no additional secrets required"

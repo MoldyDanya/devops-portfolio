@@ -1,0 +1,31 @@
+name: 'Platform Post-Build Actions'
+description: 'Execute platform-specific post-build actions'
+inputs:
+  platform:
+    description: 'Target platform (Android or iOS)'
+    required: true
+  ab_test_icons:
+    description: 'Enable A/B testing for iOS app icons'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup A/B testing for app icons (iOS)
+      if: inputs.platform == 'iOS' && inputs.ab_test_icons == 'true'
+      uses: ./.github/actions/ios-ab-test-icons
+      with:
+        icons_folder_path: 'Assets/AppIcons/ABTest'
+        
+    - name: Android post-build
+      if: inputs.platform == 'Android'
+      shell: bash
+      run: |
+        echo "✅ Android build completed - no additional post-build actions"
+        
+    - name: iOS post-build completion
+      if: inputs.platform == 'iOS'
+      shell: bash
+      run: |
+        echo "✅ iOS build completed with A/B test icons: ${{ inputs.ab_test_icons }}"

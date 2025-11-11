@@ -1,0 +1,1152 @@
+name: 🧪 Test runner (GPU)
+run-name: Test runner with GPU acceleration
+on:
+  workflow_dispatch:
+    inputs:
+      commit_hash:
+        type: string
+        description: 'Commit hash to build from (optional)'
+      alttester_license_key:
+        description: 'AltTester license key'
+        required: true
+      test_filter:
+        type: string
+        description: 'Test name filter for NUnit execution'
+        default: 'SimpleTestFlow'
+
+jobs:
+  start-instance:
+    name: Start EC2 Instance
+    uses: ./.github/workflows/manage-ec2.yml
+    with:
+      action: start
+    secrets: inherit
+
+  run-tests:
+    needs: [start-instance]
+    runs-on: [self-hosted, linux, x64, gpu]
+    env:
+      SERVUSERNAME: ${{ vars.RUNNER_USERNAME }}
+      CACHE_PATH: ${{ format('/home/{0}/actions-cache/{1}/Library-Android-Autotest', vars.RUNNER_USERNAME, vars.SAMPLE_PROJECT_NAME) }}
+    steps:
+      - name: Install NVIDIA Container Toolkit
+        run: |
+          # Download and install GPG key directly
+          sudo mkdir -p /usr/share/keyrings
+          wget -qO - https://nvidia.github.io/libnvidia-container/gpgkey | sudo tee /usr/share/keyrings/nvidia-container-toolkit-keyring.asc > /dev/null
+          
+          # Convert to GPG format
+          sudo gpg --dearmor < /usr/share/keyrings/nvidia-container-toolkit-keyring.asc | sudo tee /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg > /dev/null
+          
+          # Get system architecture
+          ARCH=$(dpkg --print-architecture)
+          echo "System architecture: $ARCH"
+          
+          # Create correct repository entry for Ubuntu
+          echo "deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://nvidia.github.io/libnvidia-container/stable/deb/$ARCH /" | \
+            sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+          
+          # Update package list
+          sudo apt-get update
+          
+          # Install toolkit
+          sudo apt-get install -y nvidia-container-toolkit
+          
+          # Configure Docker daemon
+          sudo nvidia-ctk runtime configure --runtime=docker
+          sudo systemctl restart docker
+          
+          # Verify installation
+          nvidia-ctk --version
+
+      - name: Create GPU Unity Docker image
+        run: |
+          echo "Creating simplified GPU Unity Docker image..."
+          mkdir -p ${{ github.workspace }}/docker-unity
+
+          cat > ${{ github.workspace }}/docker-unity/Dockerfile << 'EOF'
+          FROM unityci/editor:ubuntu-2022.3.40f1-android-3.1.0
+
+          # Install GPU support and essential tools only
+          RUN apt-get update && \
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                libnvidia-gl-470 \
+                xvfb \
+                openbox \
+                netcat-openbsd \
+                adwaita-icon-theme-full \
+                strace \
+                gdb \
+                x11-utils \
+                x11-xserver-utils \
+                imagemagick \
+                xdotool \
+                scrot \
+              && apt-get clean \
+              && rm -rf /var/lib/apt/lists/*
+
+          # Enable GPU support
+          ENV NVIDIA_VISIBLE_DEVICES=all
+          ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+
+          # Create directories
+          RUN mkdir -p /workspace /project/AltTesterLogs \
+              && chmod 777 /workspace /project/AltTesterLogs
+
+          WORKDIR /workspace
+
+          EXPOSE 13000
+          CMD ["/bin/bash"]
+          EOF
+
+          echo "Building GPU Unity Docker image..."
+          cd ${{ github.workspace }}/docker-unity
+          DOCKER_BUILDKIT=1 docker build --no-cache --network=host -t unity-gpu-test:latest .
+          echo "✅ GPU Unity image built successfully"
+
+      - name: Verify Unity in image
+        run: |
+          echo "Verifying Unity installation..."
+          docker run --rm unity-gpu-test:latest bash -c "which unity-editor && unity-editor -version" || \
+            (echo "❌ Unity not found in image" && exit 1)
+          echo "✅ Unity verified in image"
+
+      - uses: FraBle/clean-after-action@v2
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_hash || github.ref }}
+          # lfs: true
+
+      - name: Git LFS Pull
+        run: |
+          git lfs pull
+          git add .
+          git reset --hard
+
+      - name: Verify GPU availability
+        run: |
+          echo "Checking NVIDIA driver and GPU availability..."
+          nvidia-smi || echo "NVIDIA driver not available"
+          docker run --rm --gpus all unityci/editor:ubuntu-2022.3.40f1-android-3.1.0 nvidia-smi || echo "GPU not accessible from Docker"
+      
+      - name: Create log directories
+        run: |
+          mkdir -p ${{ github.workspace }}/AltTesterLogs/diagnostics/unity
+          mkdir -p ${{ github.workspace }}/AltTesterLogs/dialog_handler
+          chmod -R 777 ${{ github.workspace }}/AltTesterLogs
+
+      - name: Create test screenshot directories
+        run: |
+          mkdir -p ${{ github.workspace }}/AltTesterLogs/test_screenshots
+          chmod -R 777 ${{ github.workspace }}/AltTesterLogs/test_screenshots
+          echo "Test screenshot directories created"
+
+      - name: Unity Cache
+        uses: ./.github/actions/unity-cache
+        with:
+          platform: android
+          repository: ${{ github.repository }}
+          runner_username: ${{ vars.RUNNER_USERNAME }}
+          max_caches: ${{ vars.UNITY_CACHE_MAX_COUNT }}
+          max_age_days: ${{ vars.UNITY_CACHE_MAX_AGE_DAYS }}
+
+      - name: Create Unity Dialog Handler Service
+        run: |
+          cat > ${{ github.workspace }}/unity_dialog_handler.sh << 'EOF'
+          #!/bin/bash
+          # Unity dialog handler - Enhanced with External Dependency Manager Analytics support
+          # Only gentle methods, never kill Unity windows
+          
+          export DISPLAY=:99
+          LOG_FILE="/workspace/AltTesterLogs/dialog_handler/handler.log"
+          PID_FILE="/workspace/AltTesterLogs/dialog_handler/handler.pid"
+          STATS_FILE="/workspace/AltTesterLogs/dialog_handler/stats.log"
+          
+          mkdir -p "$(dirname "$LOG_FILE")"
+          echo $$ > "$PID_FILE"
+          echo "Dialog handler started at $(date)" >> "$LOG_FILE"
+          
+          # Statistics counters
+          WARNING_COUNT=0
+          BWF_COUNT=0
+          ANALYTICS_COUNT=0
+          APPLI_COUNT=0
+          EXTERNAL_DEP_ANALYTICS_COUNT=0
+          TOTAL_CHECKS=0
+          
+          log_dismissal() {
+            local dialog_type="$1"
+            local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+            echo "[$timestamp] Dismissed dialog: $dialog_type" >> "$LOG_FILE"
+          }
+          
+          update_stats() {
+            echo "Statistics as of $(date):" > "$STATS_FILE"
+            echo "Warning dialogs dismissed: $WARNING_COUNT" >> "$STATS_FILE"
+            echo "Bad Word Filter PRO dialogs dismissed: $BWF_COUNT" >> "$STATS_FILE"
+            echo "Analytics dialogs dismissed: $ANALYTICS_COUNT" >> "$STATS_FILE"
+            echo "AppLovin dialogs dismissed: $APPLI_COUNT" >> "$STATS_FILE"
+            echo "External Dependency Manager Analytics dialogs dismissed: $EXTERNAL_DEP_ANALYTICS_COUNT" >> "$STATS_FILE"
+            echo "Total checks performed: $TOTAL_CHECKS" >> "$STATS_FILE"
+          }
+          
+          # Main monitoring loop
+          while true; do
+            TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+            
+            # Handle root user warning dialog
+            if xdotool search --onlyvisible --name 'Warning' 2>/dev/null; then
+              log_dismissal "Root Warning"
+              xdotool search --onlyvisible --name 'Warning' windowactivate key Return
+              WARNING_COUNT=$((WARNING_COUNT + 1))
+              sleep 2
+            fi
+            
+            # Handle Bad Word Filter PRO
+            if xdotool search --onlyvisible --name 'Bad Word Filter PRO - Update available' 2>/dev/null; then
+              log_dismissal "Bad Word Filter PRO"
+              xdotool search --onlyvisible --name 'Bad Word Filter PRO - Update available' windowactivate key Escape
+              BWF_COUNT=$((BWF_COUNT + 1))
+              sleep 2
+            fi
+            
+            # Handle External Dependency Manager Analytics dialog - SAFE VERSION
+            if xdotool search --onlyvisible --name 'Enable Analytics for External Dependency Manager' 2>/dev/null; then
+              log_dismissal "External Dependency Manager Analytics"
+              xdotool search --onlyvisible --name 'Enable Analytics for External Dependency Manager' windowactivate key Escape
+              EXTERNAL_DEP_ANALYTICS_COUNT=$((EXTERNAL_DEP_ANALYTICS_COUNT + 1))
+              sleep 2
+            fi
+            
+            # Handle Unity Hub prompts
+            if xdotool search --onlyvisible --name 'Unity Hub' 2>/dev/null; then
+              log_dismissal "Unity Hub"
+              xdotool search --onlyvisible --name 'Unity Hub' windowactivate key Escape
+              sleep 2
+            fi
+            
+            # Handle asset store plugin update dialogs
+            if xdotool search --onlyvisible --name 'Update available' 2>/dev/null; then
+              log_dismissal "Update Available"
+              xdotool search --onlyvisible --name 'Update available' windowactivate key Escape
+              sleep 2
+            fi
+            
+            # Handle package manager dialogs
+            if xdotool search --onlyvisible --name 'Package Manager' 2>/dev/null; then
+              log_dismissal "Package Manager"
+              xdotool search --onlyvisible --name 'Package Manager' windowactivate key Escape
+              sleep 2
+            fi
+            
+            # Universal Asset Store dialog handler
+            for dialog_name in 'Asset Store' 'Package Import' 'Import Unity Package'; do
+              if xdotool search --onlyvisible --name "$dialog_name" 2>/dev/null; then
+                log_dismissal "$dialog_name"
+                xdotool search --onlyvisible --name "$dialog_name" windowactivate key Escape
+                sleep 2
+              fi
+            done
+            
+            # Generic dialog dismissal
+            for dialog_text in 'Continue anyway' 'Not right now' 'Cancel' 'Close'; do
+              if xdotool search --onlyvisible --name "$dialog_text" 2>/dev/null; then
+                log_dismissal "Generic Dialog ($dialog_text)"
+                xdotool search --onlyvisible --name "$dialog_text" windowactivate key Return
+                sleep 1
+              fi
+            done
+            
+            # Send Enter multiple times
+            for i in {1..3}; do
+              xdotool key Return
+              sleep 1
+            done
+            
+            # Send Escape to close popups
+            for i in {1..3}; do
+              xdotool key Escape  
+              sleep 1
+            done
+            
+            # Update statistics every 100 checks
+            if [ $((TOTAL_CHECKS % 100)) -eq 0 ]; then
+              update_stats
+            fi
+            
+            # Check every 10 seconds
+            sleep 10
+          done
+          
+          update_stats
+          echo "Dialog handler stopped at $(date)" >> "$LOG_FILE"
+          EOF
+          
+          chmod +x ${{ github.workspace }}/unity_dialog_handler.sh
+          echo "✅ Unity Dialog Handler Service script created"
+
+      - name: Create test execution script
+        run: |
+          cat > ${{ github.workspace }}/run_tests.sh << 'EOF'
+          #!/bin/bash
+          # GPU-accelerated Unity test execution script with ULF license support
+          
+          SCRIPT_LOG_DIR="/workspace/AltTesterLogs/diagnostics/run_tests_script"
+          mkdir -p "$SCRIPT_LOG_DIR"
+          SCRIPT_EXEC_LOG="$SCRIPT_LOG_DIR/run_tests_execution.log"
+          echo "--- run_tests.sh execution started at $(date) ---" > "$SCRIPT_EXEC_LOG"
+          exec >> "$SCRIPT_EXEC_LOG" 2>&1
+
+          set -e
+          
+          echo "Current directory: $(pwd)"
+          echo "Changing to /workspace..."
+          cd /workspace
+          echo "Current directory after cd: $(pwd)"
+          export DISPLAY=:99
+          echo "DISPLAY set to $DISPLAY"
+
+          CORE_DUMP_DIR="/workspace/AltTesterLogs/diagnostics/unity_coredumps"
+          mkdir -p "$CORE_DUMP_DIR"
+          chmod 777 "$CORE_DUMP_DIR"
+          ulimit -c unlimited
+          echo "ulimit -c is: $(ulimit -c)"
+          
+          echo "Checking for ULF license file..."
+          ULF_PATH="/root/.local/share/unity3d/Unity/Unity_lic.ulf"
+          if [ -f "$ULF_PATH" ]; then
+            echo "✅ ULF license file found at $ULF_PATH"
+            ls -la "$ULF_PATH"
+          else
+            echo "❌ WARNING: ULF license file not found at $ULF_PATH"
+            echo "Checking for backup..."
+            if [ -f "/workspace/AltTesterLogs/Unity_lic_backup.ulf" ]; then
+              echo "Restoring from backup..."
+              mkdir -p "/root/.local/share/unity3d/Unity"
+              cp "/workspace/AltTesterLogs/Unity_lic_backup.ulf" "$ULF_PATH"
+              echo "✅ License file restored from backup"
+            else
+              echo "❌ No backup found. Unity may fail to start."
+            fi
+          fi
+          
+          echo "Preparing Xvfb and Openbox..."
+          Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +extension RENDER &
+          XVFB_PID=$!
+          echo "Xvfb started with PID $XVFB_PID. Waiting for initialization..."
+          
+          # Wait for Xvfb to be ready
+          echo "Waiting for X11 to be ready..."
+          X11_READY=false
+          for i in {1..30}; do
+            if DISPLAY=:99 xwininfo -root > /dev/null 2>&1; then
+              echo "✅ X11 display ready after $i attempts"
+              X11_READY=true
+              break
+            fi
+            echo "Waiting for X11... attempt $i/30"
+            sleep 2
+          done
+          
+          if [ "$X11_READY" != "true" ]; then
+            echo "❌ FATAL: X11 display not ready after 60 seconds"
+            echo "Xvfb process status:"
+            ps aux | grep Xvfb | grep -v grep || echo "Xvfb not running"
+            kill $XVFB_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          openbox &
+          WM_PID=$!
+          echo "Openbox started with PID $WM_PID. Waiting 1 second..."
+          sleep 1 
+
+          echo "Checking for prerequisite commands (strace, gdb)..."
+          for cmd_to_check in strace gdb xwininfo xdpyinfo; do
+            if ! command -v "$cmd_to_check" &> /dev/null; then
+                echo "❌ FATAL: Command '$cmd_to_check' not found!"
+                kill $WM_PID $XVFB_PID 2>/dev/null || true
+                exit 1
+            else
+                echo "✅ Command '$cmd_to_check' found."
+            fi
+          done
+
+          echo "Locating Unity executable..."
+          UNITY_EXEC_PATH_PRIMARY="/opt/unity/Editor/Unity"
+          UNITY_EXEC="$UNITY_EXEC_PATH_PRIMARY"
+          if [ ! -x "$UNITY_EXEC" ]; then
+            echo "Unity not found at $UNITY_EXEC_PATH_PRIMARY. Fallback: Trying to find unity-editor in PATH..."
+            UNITY_EXEC_PATH_SECONDARY=$(which unity-editor)
+            if [ -z "$UNITY_EXEC_PATH_SECONDARY" ]; then
+                echo "❌ FATAL: Unity executable not found!"
+                kill $WM_PID $XVFB_PID 2>/dev/null || true; exit 1
+            else
+                UNITY_EXEC="$UNITY_EXEC_PATH_SECONDARY"
+            fi
+          fi
+          echo "Using Unity executable: $UNITY_EXEC"
+
+          # Enhanced X11 verification before Unity launch
+          echo "Final X11 verification before Unity launch..."
+          if ! DISPLAY=:99 xwininfo -root > /dev/null 2>&1; then
+            echo "❌ FATAL: Cannot connect to X11 display :99"
+            echo "Checking Xvfb process..."
+            ps aux | grep Xvfb | grep -v grep || echo "Xvfb not running"
+            echo "Testing with xdpyinfo..."
+            DISPLAY=:99 xdpyinfo || echo "xdpyinfo failed"
+            kill $WM_PID $XVFB_PID 2>/dev/null || true
+            exit 1
+          fi
+          
+          if ! DISPLAY=:99 xdpyinfo > /dev/null 2>&1; then
+            echo "❌ FATAL: xdpyinfo test failed"
+            kill $WM_PID $XVFB_PID 2>/dev/null || true
+            exit 1
+          fi
+          
+          echo "✅ X11 display connection verified with both xwininfo and xdpyinfo"
+
+          UNITY_NORMAL_LOG="/workspace/AltTesterLogs/unity-ui.log"
+          UNITY_STRACE_LOG="/workspace/AltTesterLogs/diagnostics/unity/unity-ui-strace.log"
+
+          echo "Unity normal log will be at: $UNITY_NORMAL_LOG"
+          echo "Unity strace log will be at: $UNITY_STRACE_LOG"
+          echo "Starting Unity under strace (using existing ULF license)..."
+          
+          strace -f -tt -T -o "$UNITY_STRACE_LOG" \
+            "$UNITY_EXEC" \
+              -projectPath /workspace \
+              -logFile "$UNITY_NORMAL_LOG" \
+              -display "$DISPLAY" \
+              -executeMethod TestAutomation.RunAltTesteInEditor \
+              -force-opengl &
+
+          UNITY_PID=$!
+          echo "Unity process (PID $UNITY_PID) started under strace."
+          echo "This script will now monitor PID $UNITY_PID."
+          echo "$UNITY_PID" > /workspace/AltTesterLogs/unity_pid.txt
+          echo "Unity PID $UNITY_PID saved to /workspace/AltTesterLogs/unity_pid.txt"
+
+          UNITY_EXIT_CODE=0
+          while kill -0 $UNITY_PID 2>/dev/null; do
+            echo "Unity (PID $UNITY_PID) is still running... (checked at $(date))"
+            sleep 60
+          done
+
+          echo "⚪️ Unity process (PID $UNITY_PID) is NO LONGER RUNNING."
+          if wait $UNITY_PID; then
+            UNITY_EXIT_CODE=0
+            echo "   Unity (PID $UNITY_PID) exited cleanly with code 0."
+          else
+            UNITY_EXIT_CODE=$? 
+            echo "   ⚠️ Unity (PID $UNITY_PID) exited with non-zero status: $UNITY_EXIT_CODE."
+          fi
+          
+          echo ""
+          echo "--- UNITY PROCESS POST-MORTEM DIAGNOSTICS ---"
+          echo "Timestamp: $(date)"
+          echo "Final detected Unity exit code: $UNITY_EXIT_CODE"
+          
+          echo "System Information at time of Unity exit:"
+          echo "Disk Space:"; df -h
+          echo "Memory Usage:"; free -h
+          echo "Top 5 CPU consuming processes:"; ps -eo pid,ppid,cmd,%mem,%cpu --sort=-%cpu | head -n 6
+          echo "Top 5 Memory consuming processes:"; ps -eo pid,ppid,cmd,%mem,%cpu --sort=-%mem | head -n 6
+
+          echo "Last 100 lines of Unity Editor Log ($UNITY_NORMAL_LOG):"
+          tail -n 100 "$UNITY_NORMAL_LOG" || echo "WARNING: Could not tail $UNITY_NORMAL_LOG."
+
+          echo "Last 100 lines of Unity Strace Log ($UNITY_STRACE_LOG):"
+          if [ -f "$UNITY_STRACE_LOG" ]; then
+            tail -n 100 "$UNITY_STRACE_LOG" || echo "WARNING: Could not tail $UNITY_STRACE_LOG."
+          else echo "INFO: $UNITY_STRACE_LOG not found or empty."; fi
+          
+          echo "Searching for core dumps in $CORE_DUMP_DIR..."
+          CORE_FILES=$(find "$CORE_DUMP_DIR" -name "core.*" -type f -print)
+          if [ -n "$CORE_FILES" ]; then
+            echo "Found core dump files:"; echo "$CORE_FILES"
+            for CORE_FILE_PATH in $CORE_FILES; do
+              echo "--- Analyzing core dump: $CORE_FILE_PATH ---"
+              CORE_ANALYSIS_LOG="$CORE_DUMP_DIR/analysis_$(basename "$CORE_FILE_PATH").txt"
+              gdb -nx --batch -ex "set pagination off" -ex "thread apply all bt full" -ex "quit" "$UNITY_EXEC" "$CORE_FILE_PATH" > "$CORE_ANALYSIS_LOG" 2>&1
+              if [ $? -eq 0 ]; then
+                echo "GDB analysis for $CORE_FILE_PATH completed. Check $CORE_ANALYSIS_LOG.";
+                echo "Last 50 lines of GDB analysis:"; tail -n 50 "$CORE_ANALYSIS_LOG"
+              else
+                echo "⚠️ GDB analysis for $CORE_FILE_PATH failed. Check $CORE_ANALYSIS_LOG."; cat "$CORE_ANALYSIS_LOG"
+              fi; done
+          else echo "No core dump files found in $CORE_DUMP_DIR matching 'core.*'."; fi
+          
+          echo "Checking dmesg for recent OOM Killer messages or kernel panics..."
+          dmesg | grep -E -i 'killed process|oom-killer|kernel panic|segfault' | tail -n 20 || echo "No critical messages found in recent dmesg output."
+          echo "--- End of Post-Mortem Diagnostics ---"
+          echo ""
+
+          echo "Cleaning up Xvfb (PID $XVFB_PID) and Openbox (PID $WM_PID)..."
+          kill $WM_PID $XVFB_PID 2>/dev/null || true 
+
+          echo "--- run_tests.sh execution finished at $(date) ---"
+          exit $UNITY_EXIT_CODE 
+          EOF
+
+          chmod +x ${{ github.workspace }}/run_tests.sh
+          echo "✅ Unity execution script created"
+
+      - name: Cleanup existing Docker resources
+        run: |
+          echo "Cleaning up existing Docker resources..."
+          docker stop alttester unity-container 2>/dev/null || true
+          docker rm alttester unity-container 2>/dev/null || true
+          echo "Cleanup completed"
+
+      - name: Create or reuse Docker network
+        run: |
+          if docker network inspect test-network >/dev/null 2>&1; then
+            echo "Network test-network already exists"
+          else
+            echo "Creating test-network"
+            docker network create test-network
+          fi
+
+      - name: Start AltTester Docker container
+        run: |
+          docker run -d -p 13000:13000 \
+            --network test-network \
+            --name alttester \
+            -v "${{ github.workspace }}/AltTesterLogs:/AltTesterLogs" \
+            -e TERMS_AND_CONDS=accepted \
+            -e ALTTESTER_DESKTOP_LICENSE=${{ inputs.alttester_license_key }} \
+            alttestertools/alttester:latest
+          
+          sleep 5
+          if [ -z "$(docker ps -q -f "name=alttester")" ]; then
+            echo "❌ Error starting AltTester container!"
+            docker logs alttester
+            exit 1
+          else
+            echo "✅ AltTester container started successfully"
+          fi
+
+      - name: Start Unity container
+        run: |
+          docker run -d --name unity-container \
+            --gpus all \
+            --memory=15g \
+            --cpus=4 \
+            --shm-size=2g \
+            --network test-network \
+            -e NVIDIA_VISIBLE_DEVICES=all \
+            -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+            -e DISPLAY=:99 \
+            -e UNITY_EMAIL=${{ secrets.UNITY_EMAIL }} \
+            -e UNITY_PASSWORD=${{ secrets.UNITY_PASSWORD }} \
+            -e UNITY_SERIAL=${{ secrets.UNITY_SERIAL }} \
+            -v ${{ github.workspace }}:/workspace \
+            unity-gpu-test:latest \
+            bash -c "sleep infinity"
+
+      - name: Start Unity Dialog Handler Service
+        run: |
+          echo "Starting Unity Dialog Handler background service..."
+          docker exec -d unity-container bash -c "/workspace/unity_dialog_handler.sh"
+          
+          # Wait a moment and verify service started
+          sleep 3
+          HANDLER_PID=$(docker exec unity-container cat /workspace/AltTesterLogs/dialog_handler/handler.pid 2>/dev/null || echo "")
+          
+          if [ -n "$HANDLER_PID" ]; then
+            echo "✅ Dialog Handler Service started with PID: $HANDLER_PID"
+            docker exec unity-container bash -c "ps aux | grep $HANDLER_PID | grep -v grep" || echo "⚠️ Handler process not visible in ps"
+          else
+            echo "❌ Failed to start Dialog Handler Service"
+            exit 1
+          fi
+
+      - name: Pre-Unity dialog prevention
+        run: |
+          echo "Preventing Unity dialogs through configuration..."
+          docker exec unity-container bash -c "
+            # Create Unity preferences to disable dialogs
+            mkdir -p /root/.config/unity3d/Unity/Editor-5.x/
+            
+            # Disable analytics and update checks
+            cat > /root/.config/unity3d/Unity/Editor-5.x/Preferences.txt << 'EOF'
+          DeveloperMode=1
+          EnableAnalytics=0
+          CheckForUpdates=0
+          AssetStoreUpdateChecking=0
+          EOF
+            
+            echo 'Unity preferences configured to prevent dialogs'
+          "
+
+      - name: Activate Unity license and check ULF file
+        env:
+          UNITY_EMAIL:    ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_SERIAL:   ${{ secrets.UNITY_SERIAL }}
+        run: |
+          echo ">>> Activating Unity license inside unity-container"
+          docker exec unity-container bash -c '
+            export DISPLAY=:99
+            /opt/unity/Editor/Unity -batchmode \
+              -username "$UNITY_EMAIL" \
+              -password "$UNITY_PASSWORD" \
+              -serial   "$UNITY_SERIAL" \
+              -logFile /workspace/AltTesterLogs/activation.log \
+              -quit
+          '
+          echo ">>> Activation log:"
+          docker exec unity-container tail -n20 /workspace/AltTesterLogs/activation.log
+          if ! docker exec unity-container grep -qE "Successfully activated ULF license|Serial number assigned" /workspace/AltTesterLogs/activation.log; then
+            echo "❌ License activation failed"
+            docker exec unity-container cat /workspace/AltTesterLogs/activation.log
+            exit 1
+          fi
+          echo "✅ Unity license activated"
+          
+          echo ">>> Checking for ULF license file"
+          docker exec unity-container bash -c '
+            ULF_PATH="/root/.local/share/unity3d/Unity/Unity_lic.ulf"
+            if [ -f "$ULF_PATH" ]; then
+              echo "✅ ULF license file found at $ULF_PATH"
+              ls -la "$ULF_PATH"
+              # Create backup copy
+              cp "$ULF_PATH" /workspace/AltTesterLogs/Unity_lic_backup.ulf
+              echo "License file backed up to /workspace/AltTesterLogs/"
+            else
+              echo "❌ ULF license file NOT found at $ULF_PATH"
+              echo "Checking alternative locations:"
+              find /root -name "*.ulf" 2>/dev/null || echo "No .ulf files found"
+              exit 1
+            fi
+          '
+
+      - name: Run Unity Import in Batch Mode
+        run: |
+          echo "Running Unity import in batch mode..."
+          docker exec unity-container bash -c "
+            /opt/unity/Editor/Unity -batchmode -nographics -quit \
+              -projectPath /workspace \
+              -logfile /workspace/AltTesterLogs/batch-import.log \
+              -refreshImportMode OutOfProcessPerQueue \
+              -desiredImportWorkerCount 4 \
+              -standbyImportWorkerCount 2 || echo 'Batch import failed'
+          "
+          echo "Checking batch import results..."
+          docker exec unity-container cat /workspace/AltTesterLogs/batch-import.log || echo 'No batch import log found'
+          docker exec unity-container bash -c "
+            if grep -q 'Refresh completed' /workspace/AltTesterLogs/batch-import.log; then
+              echo '✅ Batch import completed'
+            else
+              echo '❌ Batch import failed'
+              exit 1
+            fi
+          " || echo 'Could not verify import completion'
+
+      - name: Run Unity tests with GPU acceleration
+        run: |
+          echo ">>> Starting run_tests.sh in background"
+          echo ">>> Check /workspace/AltTesterLogs/unity-ui.log for Unity output"
+          docker exec -d unity-container bash -lc "/workspace/run_tests.sh"
+          
+          # Wait a bit and check if script started
+          sleep 10
+          echo ">>> Checking run_tests.sh execution status"
+          docker exec unity-container bash -c "
+            if [ -f '/workspace/AltTesterLogs/diagnostics/run_tests_script/run_tests_execution.log' ]; then
+              echo 'run_tests.sh execution log found:'
+              tail -n 20 /workspace/AltTesterLogs/diagnostics/run_tests_script/run_tests_execution.log
+            else
+              echo 'ERROR: run_tests.sh execution log not found'
+            fi
+            
+            echo 'Checking if run_tests.sh process is running:'
+            ps aux | grep run_tests.sh | grep -v grep || echo 'run_tests.sh process not found'
+            
+            echo 'Checking Unity processes:'
+            ps aux | grep Unity | grep -v grep || echo 'No Unity processes found'
+          "
+
+      - name: Monitor Unity GUI readiness 
+        timeout-minutes: 20
+        run: |
+          echo "Monitoring Unity GUI readiness (max 20 minutes)..."
+          STARTUP_TIMEOUT_SECONDS=1200
+          SLEEP_INTERVAL_SECONDS=15
+          ELAPSED_TIME_SECONDS=0
+          
+          UNITY_LOG_FILE_IN_CONTAINER="/workspace/AltTesterLogs/unity-ui.log"
+          UNITY_PID_FILE_IN_CONTAINER="/workspace/AltTesterLogs/unity_pid.txt"
+
+          exec_in_container() {
+            docker exec unity-container bash -lc "$1"
+          }
+          
+          if ! docker ps -q -f name=unity-container | grep -q .; then
+            echo "❌ FATAL: Unity container not running"
+            exit 1
+          fi
+          echo "Unity container running. Dialog Handler Service managing all dialogs in background."
+
+          UNITY_GUI_READY=false
+          
+          while [ $ELAPSED_TIME_SECONDS -lt $STARTUP_TIMEOUT_SECONDS ]; do
+            UNITY_PID=$(exec_in_container "cat $UNITY_PID_FILE_IN_CONTAINER 2>/dev/null" | tr -d '\r\n')
+            if [ -z "$UNITY_PID" ] || ! exec_in_container "kill -0 $UNITY_PID" 2>/dev/null; then
+              echo "❌ ERROR: Unity process died during startup"
+              exit 1
+            fi
+
+            echo "   Unity process (PID $UNITY_PID) is alive. Elapsed: ${ELAPSED_TIME_SECONDS}s / ${STARTUP_TIMEOUT_SECONDS}s"
+
+            # Check Unity readiness using compilation detector
+            UNITY_WINDOW_COUNT=$(exec_in_container "xdotool search --name 'Unity.*workspace' 2>/dev/null | wc -l" || echo "0")
+            
+            # Check for compilation detector initialization
+            COMPILATION_READY=false
+            if exec_in_container "[ -f '$UNITY_LOG_FILE_IN_CONTAINER' ]" > /dev/null 2>&1; then
+              if exec_in_container "grep -q 'COMPILATION_DETECTOR: Initialized' '$UNITY_LOG_FILE_IN_CONTAINER'" > /dev/null 2>&1; then
+                COMPILATION_READY=true
+              fi
+              
+              # Alternative: Check if Unity has finished loading project
+              if exec_in_container "grep -q 'Successfully opened project' '$UNITY_LOG_FILE_IN_CONTAINER'" > /dev/null 2>&1; then
+                echo "   ℹ️ Detected 'Successfully opened project' in Unity logs"
+                COMPILATION_READY=true
+              fi
+              
+              # Alternative: Check if Unity is past initial loading phase
+              if exec_in_container "grep -q 'Refreshing native plugins' '$UNITY_LOG_FILE_IN_CONTAINER'" > /dev/null 2>&1; then
+                echo "   ℹ️ Detected Unity past initial loading phase"
+              fi
+            fi
+            
+            # Enhanced readiness check - Unity is ready when:
+            # 1. Has Unity windows
+            # 2. Compilation detector initialized OR Unity has been running stably for sufficient time
+            MINIMUM_RUNTIME_FOR_FALLBACK=300  # 5 minutes for faster feedback
+            STABLE_RUNTIME_FOR_READY=180      # Consider ready if stable for 3 minutes
+            
+            COMPILATION_READY_OR_TIMEOUT=$COMPILATION_READY
+            
+            # Alternative readiness criteria: Unity is stable and has been running for a while
+            if [ $ELAPSED_TIME_SECONDS -ge $STABLE_RUNTIME_FOR_READY ]; then
+              # Check if Unity has been stable (process alive) for the last few checks
+              if [ "$UNITY_WINDOW_COUNT" -gt 0 ] || [ $ELAPSED_TIME_SECONDS -ge $MINIMUM_RUNTIME_FOR_FALLBACK ]; then
+                echo "   ℹ️ Using stability-based readiness criteria (Unity stable for ${ELAPSED_TIME_SECONDS}s)"
+                COMPILATION_READY_OR_TIMEOUT=true
+              fi
+            fi
+            
+            if [ "$UNITY_WINDOW_COUNT" -gt 0 ] && [ "$COMPILATION_READY_OR_TIMEOUT" = true ]; then
+              echo "✅ SUCCESS: Unity is fully ready"
+              echo "   Unity windows: $UNITY_WINDOW_COUNT"
+              echo "   Compilation ready: $COMPILATION_READY"
+              echo "   Runtime: ${ELAPSED_TIME_SECONDS}s"
+              
+              UNITY_GUI_READY=true
+              break
+            else
+              echo "   Unity status: Windows=$UNITY_WINDOW_COUNT, CompilationReady=$COMPILATION_READY"
+              
+              if [ "$COMPILATION_READY" = false ] && [ $ELAPSED_TIME_SECONDS -lt $MINIMUM_RUNTIME_FOR_FALLBACK ]; then
+                echo "   Waiting for compilation detector initialization..."
+              fi
+              
+              # Detailed logging every 5 minutes
+              if [ $((ELAPSED_TIME_SECONDS % 300)) -eq 0 ] && [ $ELAPSED_TIME_SECONDS -gt 0 ]; then
+                echo "   📊 5-minute status report:"
+                exec_in_container "
+                  echo '   Unity log lines:' && wc -l '$UNITY_LOG_FILE_IN_CONTAINER' 2>/dev/null || echo '   Unity log not found'
+                  echo '   Last 10 lines of Unity log:'
+                  tail -n 10 '$UNITY_LOG_FILE_IN_CONTAINER' 2>/dev/null || echo '   Cannot read Unity log'
+                  echo '   All visible windows:'
+                  xdotool search --onlyvisible '.*' 2>/dev/null | wc -l || echo '   Cannot count windows'
+                " || echo "   Container communication failed"
+              fi
+            fi
+
+            sleep $SLEEP_INTERVAL_SECONDS
+            ELAPSED_TIME_SECONDS=$((ELAPSED_TIME_SECONDS + SLEEP_INTERVAL_SECONDS))
+          done
+
+          echo ""
+          echo "--- Unity GUI Readiness Summary ---"
+          if [ "$UNITY_GUI_READY" = true ]; then
+            echo "✅ Final Status: UNITY GUI READY"
+            echo "   Unity is ready for test execution"
+            echo "   Total startup time: ${ELAPSED_TIME_SECONDS}s"
+            exit 0
+          else
+            echo "❌ Final Status: TIMEOUT - Unity GUI not ready within $STARTUP_TIMEOUT_SECONDS seconds"
+            echo "   Final status: Windows=$UNITY_WINDOW_COUNT, CompilationReady=$COMPILATION_READY"
+            echo "   Total runtime: ${ELAPSED_TIME_SECONDS}s"
+            exit 1
+          fi
+      
+      - name: Monitor Unity Compilation Status (simplified)
+        if: success() 
+        timeout-minutes: 30
+        run: |
+          echo "Monitoring Unity compilation status (max 30 minutes)..."
+          COMPILATION_TIMEOUT_SECONDS=1800
+          SLEEP_INTERVAL_SECONDS=15
+          ELAPSED_TIME_SECONDS=0
+          
+          UNITY_LOG_FILE_IN_CONTAINER="/workspace/AltTesterLogs/unity-ui.log"
+          UNITY_PID_FILE_IN_CONTAINER="/workspace/AltTesterLogs/unity_pid.txt"
+
+          MARKER_COMPILATION_STARTED="COMPILATION_STARTED:" 
+          MARKER_COMPILATION_SUCCESS="COMPILATION_SUCCESSFUL:"
+          MARKER_COMPILATION_ERROR="COMPILATION_FAILED|COMPILATION_ERROR:"
+
+          exec_in_container() {
+            docker exec unity-container bash -lc "$1"
+          }
+          
+          if ! docker ps -q -f name=unity-container | grep -q .; then
+            echo "❌ FATAL: Unity container not running at start of compilation monitoring"
+            exit 1
+          fi
+          echo "Unity container running. Dialog handler managing all dialogs during compilation."
+
+          COMPILATION_HAS_STARTED_FLAG=false
+          COMPILATION_FINAL_STATUS="UNKNOWN"
+
+          while [ $ELAPSED_TIME_SECONDS -lt $COMPILATION_TIMEOUT_SECONDS ]; do
+            UNITY_PID=$(exec_in_container "cat $UNITY_PID_FILE_IN_CONTAINER 2>/dev/null" | tr -d '\r\n')
+            if [ -z "$UNITY_PID" ] || ! exec_in_container "kill -0 $UNITY_PID" 2>/dev/null; then
+              echo "❌ ERROR: Unity process died unexpectedly during compilation monitoring"
+              COMPILATION_FINAL_STATUS="UNITY_DIED"
+              break
+            fi
+            echo "   Unity process (PID $UNITY_PID) is alive. Elapsed: ${ELAPSED_TIME_SECONDS}s / ${COMPILATION_TIMEOUT_SECONDS}s"
+
+            if ! exec_in_container "[ -f '$UNITY_LOG_FILE_IN_CONTAINER' ]" > /dev/null 2>&1; then
+              echo "   Waiting for Unity log file to appear..."
+              sleep $SLEEP_INTERVAL_SECONDS
+              ELAPSED_TIME_SECONDS=$((ELAPSED_TIME_SECONDS + SLEEP_INTERVAL_SECONDS))
+              continue
+            fi
+
+            if exec_in_container "grep -qE \"$MARKER_COMPILATION_ERROR\" '$UNITY_LOG_FILE_IN_CONTAINER'" > /dev/null 2>&1; then
+              echo "❌ ERROR: Compilation error detected"
+              echo "   Relevant error lines:"
+              exec_in_container "grep -A 5 -E \"$MARKER_COMPILATION_ERROR\" '$UNITY_LOG_FILE_IN_CONTAINER'" || echo "   (Could not retrieve error lines)"
+              COMPILATION_FINAL_STATUS="FAILED"
+              break
+            fi
+
+            if exec_in_container "grep -qE \"$MARKER_COMPILATION_SUCCESS\" '$UNITY_LOG_FILE_IN_CONTAINER'" > /dev/null 2>&1; then
+              echo "✅ SUCCESS: Compilation completed successfully"
+              COMPILATION_FINAL_STATUS="SUCCESS"
+              break
+            fi
+            
+            if [ "$COMPILATION_HAS_STARTED_FLAG" = false ]; then
+              if exec_in_container "grep -qE \"$MARKER_COMPILATION_STARTED\" '$UNITY_LOG_FILE_IN_CONTAINER'" > /dev/null 2>&1; then
+                echo "   INFO: Compilation has started. Monitoring for completion..."
+                COMPILATION_HAS_STARTED_FLAG=true
+              else
+                echo "   Waiting for compilation to start..."
+              fi
+            else
+              echo "   Compilation in progress... (dialog handler active)"
+            fi
+
+            sleep $SLEEP_INTERVAL_SECONDS
+            ELAPSED_TIME_SECONDS=$((ELAPSED_TIME_SECONDS + SLEEP_INTERVAL_SECONDS))
+          done
+
+          echo ""
+          echo "--- Compilation Monitoring Summary ---"
+          if [ "$COMPILATION_FINAL_STATUS" = "SUCCESS" ]; then
+            echo "✅ Final Status: COMPILATION SUCCEEDED"
+            exit 0
+          elif [ "$COMPILATION_FINAL_STATUS" = "FAILED" ]; then
+            echo "❌ Final Status: COMPILATION FAILED"
+            echo "   Last 50 lines of Unity log:"
+            exec_in_container "tail -n 50 '$UNITY_LOG_FILE_IN_CONTAINER'" || true
+            exit 1
+          elif [ "$COMPILATION_FINAL_STATUS" = "UNITY_DIED" ]; then
+            echo "❌ Final Status: UNITY PROCESS DIED UNEXPECTEDLY"
+            echo "   Last 50 lines of Unity log:"
+            exec_in_container "tail -n 50 '$UNITY_LOG_FILE_IN_CONTAINER'" || true
+            exit 1
+          else
+            echo "❌ Final Status: TIMEOUT - Compilation did not complete within $COMPILATION_TIMEOUT_SECONDS seconds"
+            echo "   Compilation started: $COMPILATION_HAS_STARTED_FLAG"
+            echo "   Last 50 lines of Unity log:"
+            exec_in_container "tail -n 50 '$UNITY_LOG_FILE_IN_CONTAINER'" || true
+            exit 1
+          fi
+
+      - name: Take Unity Ready Screenshot
+        if: success()
+        run: |
+          echo "Taking Unity ready state screenshot..."
+          docker exec unity-container bash -c "
+            export DISPLAY=:99
+            mkdir -p /workspace/AltTesterLogs/screenshots
+            import -window root /workspace/AltTesterLogs/screenshots/unity_ready_final.png 2>/dev/null || echo 'Unity ready screenshot failed'
+            echo 'Unity ready screenshot saved'
+          "
+
+      - name: Verify AltTester connection
+        run: |
+          echo "Verifying AltTester connection..."
+          timeout=300
+          interval=10
+          elapsed=0
+          
+          while [ $elapsed -lt $timeout ]; do
+            if ! docker ps -q -f "name=unity-container" | grep -q .; then
+                echo "❌ Unity container is not running. Unity likely crashed or exited."
+                exit 1
+            fi
+
+            if nc -z localhost 13000; then
+              echo "✅ AltTester connection established!"
+              break
+            fi
+            
+            sleep $interval
+            elapsed=$((elapsed + interval))
+            echo "Waiting for AltTester connection... (${elapsed}s/${timeout}s)"
+          done
+          
+          if [ $elapsed -ge $timeout ]; then
+            echo "❌ AltTester connection timeout!"
+            echo "Debug Info: Unity container logs:"
+            docker logs unity-container || echo "Unity container already stopped"
+            echo "Debug Info: AltTester container logs:"
+            docker logs alttester
+            exit 1
+          fi
+
+      - name: Take AltTester Connected Screenshot
+        if: success()
+        run: |
+          echo "Taking AltTester connection screenshot..."
+          docker exec unity-container bash -c "
+            export DISPLAY=:99
+            mkdir -p /workspace/AltTesterLogs/screenshots
+            import -window root /workspace/AltTesterLogs/screenshots/alttester_connected.png 2>/dev/null || echo 'AltTester connection screenshot failed'
+            echo 'AltTester connection screenshot saved'
+          "
+
+      - name: Ensure .NET SDK is installed
+        run: |
+          if ! command -v dotnet &> /dev/null; then
+              echo "Installing .NET SDK..."
+              wget https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
+              chmod +x ./dotnet-install.sh
+              ./dotnet-install.sh --version latest
+              echo "$HOME/.dotnet" >> $GITHUB_PATH
+              echo "DOTNET_ROOT=$HOME/.dotnet" >> $GITHUB_ENV
+          else
+              echo "✅ .NET SDK already installed"
+              dotnet --version
+          fi
+
+      - name: Run NUnit Tests
+        env:
+          TEST_ENV: Editor
+        run: |
+          cd AutoTests
+          dotnet test AutoTests.sln \
+            --configuration Release \
+            --filter "FullyQualifiedName~${{ inputs.test_filter }}" \
+            --logger "console;verbosity=detailed" \
+            --logger "trx;LogFileName=TestResults.trx" \
+            --results-directory TestResults \
+            | tee ${{ github.workspace }}/AltTesterLogs/dotnet-test.log
+
+      - name: Take NUnit End Screenshot
+        if: always()
+        run: |
+          echo "Taking NUnit End state screenshot..."
+          docker exec unity-container bash -c "
+            export DISPLAY=:99
+            mkdir -p /workspace/AltTesterLogs/screenshots
+            import -window root /workspace/AltTesterLogs/screenshots/NUnit_end.png 2>/dev/null || echo 'NUnit end screenshot failed'
+            echo 'NUnit end screenshot saved'
+          "
+
+      - name: Print Test Logs
+        if: always()
+        run: cat ${{ github.workspace }}/AltTesterLogs/dotnet-test.log || echo "No test logs found"
+
+      - name: Publish Test Results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+            files: '**/TestResults/*.trx'
+
+      - name: Collect Dialog Handler Statistics
+        if: always()
+        run: |
+          echo "Collecting Dialog Handler Service statistics..."
+          docker exec unity-container bash -c "
+            if [ -f '/workspace/AltTesterLogs/dialog_handler/handler.pid' ]; then
+              HANDLER_PID=\$(cat /workspace/AltTesterLogs/dialog_handler/handler.pid)
+              echo 'Dialog Handler PID: '\$HANDLER_PID
+              
+              if kill -0 \$HANDLER_PID 2>/dev/null; then
+                echo 'Dialog Handler is still running'
+                # Force final statistics update
+                kill -USR1 \$HANDLER_PID 2>/dev/null || echo 'Could not send USR1 to handler'
+                sleep 2
+              else
+                echo 'Dialog Handler has stopped'
+              fi
+            fi
+            
+            echo 'Dialog Handler logs:'
+            if [ -f '/workspace/AltTesterLogs/dialog_handler/handler.log' ]; then
+              echo 'Handler activity log:'
+              cat /workspace/AltTesterLogs/dialog_handler/handler.log
+            else
+              echo 'No handler log found'
+            fi
+            
+            if [ -f '/workspace/AltTesterLogs/dialog_handler/stats.log' ]; then
+              echo 'Final statistics:'
+              cat /workspace/AltTesterLogs/dialog_handler/stats.log
+            else
+              echo 'No statistics found'
+            fi
+          " || echo "Failed to collect dialog handler statistics"
+
+      - name: Stop Unity Dialog Handler Service
+        if: always()
+        run: |
+          echo "Stopping Unity Dialog Handler Service..."
+          docker exec unity-container bash -c "
+            if [ -f '/workspace/AltTesterLogs/dialog_handler/handler.pid' ]; then
+              HANDLER_PID=\$(cat /workspace/AltTesterLogs/dialog_handler/handler.pid)
+              echo 'Stopping Dialog Handler PID: '\$HANDLER_PID
+              
+              if kill -0 \$HANDLER_PID 2>/dev/null; then
+                # Graceful shutdown
+                kill -TERM \$HANDLER_PID 2>/dev/null
+                sleep 3
+                
+                # Force kill if still running
+                if kill -0 \$HANDLER_PID 2>/dev/null; then
+                  echo 'Handler still running, force killing...'
+                  kill -KILL \$HANDLER_PID 2>/dev/null
+                fi
+                
+                echo '✅ Dialog Handler Service stopped'
+              else
+                echo 'Dialog Handler was already stopped'
+              fi
+            else
+              echo 'No Dialog Handler PID file found'
+            fi
+          " || echo "Failed to stop dialog handler service"
+
+      - name: Deep Unity Diagnostics
+        if: failure()
+        run: |
+          echo "=== DEEP UNITY DIAGNOSTICS ==="
+          
+          # Take diagnostic screenshot first
+          echo "--- Taking Final Diagnostic Screenshot ---"
+          docker exec unity-container bash -c "
+            export DISPLAY=:99
+            mkdir -p /workspace/AltTesterLogs/screenshots
+            import -window root /workspace/AltTesterLogs/screenshots/unity_deep_diagnostic.png 2>/dev/null || echo 'Deep diagnostic screenshot failed'
+          "
+          
+          # 1. Full Unity log analysis
+          echo "--- Full Unity Log Analysis ---"
+          docker exec unity-container bash -c "
+            if [ -f '/workspace/AltTesterLogs/unity-ui.log' ]; then
+              echo 'Total log lines:' && wc -l /workspace/AltTesterLogs/unity-ui.log
+              echo 'Last 50 lines of Unity log:'
+              tail -n 50 /workspace/AltTesterLogs/unity-ui.log
+              echo 'Searching for blocking dialogs:'
+              grep -i -E 'dialog|popup|modal|confirm|approve|accept|terms|agreement' /workspace/AltTesterLogs/unity-ui.log || echo 'No dialog keywords found'
+              echo 'Searching for errors:'
+              grep -E 'Error|Exception|Failed|Timeout|CompilerError' /workspace/AltTesterLogs/unity-ui.log || echo 'No critical errors found'
+            else
+              echo 'Unity log file not found'
+            fi
+          "
+          
+          # 2. Dialog Handler Service diagnostics
+          echo "--- Dialog Handler Service Diagnostics ---"
+          docker exec unity-container bash -c "
+            echo 'Dialog Handler final logs:'
+            if [ -f '/workspace/AltTesterLogs/dialog_handler/handler.log' ]; then
+              echo 'Last 50 lines of dialog handler log:'
+              tail -n 50 /workspace/AltTesterLogs/dialog_handler/handler.log
+            else
+              echo 'No dialog handler log found'
+            fi
+            
+            if [ -f '/workspace/AltTesterLogs/dialog_handler/stats.log' ]; then
+              echo 'Dialog handling statistics:'
+              cat /workspace/AltTesterLogs/dialog_handler/stats.log
+            else
+              echo 'No dialog statistics found'
+            fi
+          "
+          
+          # 3. Unity process analysis
+          echo "--- Unity Process Analysis ---"
+          docker exec unity-container bash -c "
+            UNITY_PID=\$(cat /workspace/AltTesterLogs/unity_pid.txt 2>/dev/null || echo 'unknown')
+            if [ '\$UNITY_PID' != 'unknown' ]; then
+              echo 'Unity PID: '\$UNITY_PID
+              echo 'Process status:'
+              ps aux | grep \$UNITY_PID | grep -v grep || echo 'Process not found in ps'
+            else
+              echo 'Unity PID not available'
+            fi
+          "
+          
+          # 4. GUI window analysis
+          echo "--- GUI Window Analysis ---"
+          docker exec unity-container bash -c "
+            export DISPLAY=:99
+            echo 'Unity windows search:'
+            xdotool search --name 'Unity' || echo 'No Unity windows found'
+            echo 'All visible windows:'
+            xdotool search --onlyvisible '.*' 2>/dev/null | wc -l || echo 'Cannot count windows'
+          "
+
+      - name: Fix Permissions
+        if: always()
+        uses: ./.github/actions/fix-permissions
+        with:
+          username: ${{ env.SERVUSERNAME }}
+          workspace: ${{ github.workspace }}
+
+      - name: Upload Test Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-test-logs
+          path: |
+            ${{ github.workspace }}/AltTesterLogs/
+            ${{ github.workspace }}/**/TestResults/*.trx
+          retention-days: 7
+
+      - name: Final cleanup
+        if: always()
+        run: |
+          echo "Final Docker cleanup..."
+          docker stop alttester || true
+          docker rm alttester || true
+          docker stop unity-container || true
+          docker rm unity-container || true
+          docker network rm test-network || true
+          docker rmi unity-gpu-test:latest || true
+          echo "✅ GPU test workflow completed"

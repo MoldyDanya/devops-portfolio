@@ -1,0 +1,139 @@
+name: 'Checkout with Git LFS'
+description: 'Checkout repository with Git LFS pull, supporting branch name or commit hash'
+inputs:
+  branch_name:
+    description: 'Branch name to checkout'
+    required: true
+    default: ''
+  commit_hash:
+    description: 'Commit hash to checkout (has priority over branch_name)'
+    required: false
+    default: ''
+outputs:
+  checkout_ref:
+    description: 'The actual ref that was checked out'
+    value: ${{ steps.determine-ref.outputs.checkout_ref }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate branch exists
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.branch_name }}" ]; then
+          if ! git ls-remote --heads origin "${{ inputs.branch_name }}" | grep -q "${{ inputs.branch_name }}"; then
+            echo "❌ The branch '${{ inputs.branch_name }}' does not exist in the remote repository!"
+            exit 1
+          fi
+          echo "✅ The branch '${{ inputs.branch_name }}' found"
+        fi
+
+    - name: Determine checkout ref
+      id: determine-ref
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.commit_hash }}" ]; then
+          echo "checkout_ref=${{ inputs.commit_hash }}" >> $GITHUB_OUTPUT
+          echo "Using commit hash: ${{ inputs.commit_hash }}"
+        elif [ -n "${{ inputs.branch_name }}" ]; then
+          echo "checkout_ref=${{ inputs.branch_name }}" >> $GITHUB_OUTPUT
+          echo "Using branch name: ${{ inputs.branch_name }}"
+        else
+          echo "checkout_ref=${{ github.ref }}" >> $GITHUB_OUTPUT
+          echo "Using default ref: ${{ github.ref }}"
+        fi
+
+    - name: Save actions and scripts folders
+      shell: bash
+      run: |
+        if [ -d ".github/actions" ]; then
+          echo "📁 Contents of .github/actions before backup:"
+          ls -la .github/actions/
+          mkdir -p ../github-actions-backup
+          cp -a .github/actions/* ../github-actions-backup/
+          echo "✅ Actions folder saved to ../github-actions-backup"
+          echo "📁 Backup contents:"
+          ls -la ../github-actions-backup/
+        else
+          echo "⚠️ No .github/actions folder found to save"
+        fi
+        
+        if [ -d ".github/scripts" ]; then
+          echo "📁 Contents of .github/scripts before backup:"
+          ls -la .github/scripts/
+          mkdir -p ../github-scripts-backup
+          cp -a .github/scripts/* ../github-scripts-backup/
+          echo "✅ Scripts folder saved to ../github-scripts-backup"
+          echo "📁 Scripts backup contents:"
+          ls -la ../github-scripts-backup/
+        else
+          echo "⚠️ No .github/scripts folder found to save"
+        fi
+        
+        if [ -d "fastlane" ]; then
+          echo "📁 Contents of fastlane before backup:"
+          ls -la fastlane/
+          mkdir -p ../fastlane-backup
+          cp -a fastlane/* ../fastlane-backup/
+          echo "✅ Fastlane folder saved to ../fastlane-backup"
+          echo "📁 Fastlane backup contents:"
+          ls -la ../fastlane-backup/
+        else
+          echo "⚠️ No fastlane folder found to save"
+        fi
+
+    - name: Checkout project repository
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ steps.determine-ref.outputs.checkout_ref }}
+
+    - name: Git LFS Pull
+      shell: bash
+      run: git lfs pull
+
+    - name: Restore actions and scripts folders
+      shell: bash
+      run: |
+        if [ -d "../github-actions-backup" ]; then
+          echo "📁 Contents before restore:"
+          ls -la .github/ || echo "No .github folder"
+          rm -rf .github/actions
+          mkdir -p .github
+          cp -a ../github-actions-backup .github/actions
+          echo "✅ Actions folder restored from backup"
+          
+          echo "🔧 Normalizing line endings for shell scripts..."
+          find .github/actions -name "*.sh" -exec sed -i 's/\r$//' {} \;
+          echo "✅ Line endings normalized"
+          
+          echo "📁 Contents after restore:"
+          ls -la .github/actions/
+          echo "📋 Unity-cache action check:"
+          ls -la .github/actions/unity-cache/ || echo "❌ unity-cache not found"
+        else
+          echo "⚠️ No actions backup found to restore"
+        fi
+        
+        if [ -d "../github-scripts-backup" ]; then
+          echo "📁 Restoring scripts folder..."
+          rm -rf .github/scripts
+          mkdir -p .github
+          cp -a ../github-scripts-backup .github/scripts
+          echo "✅ Scripts folder restored from backup"
+          
+          echo "📁 Scripts contents after restore:"
+          ls -la .github/scripts/
+        else
+          echo "⚠️ No scripts backup found to restore"
+        fi
+        
+        if [ -d "../fastlane-backup" ]; then
+          echo "📁 Restoring fastlane folder..."
+          rm -rf fastlane
+          cp -a ../fastlane-backup fastlane
+          echo "✅ Fastlane folder restored from backup"
+          
+          echo "📁 Fastlane contents after restore:"
+          ls -la fastlane/
+        else
+          echo "⚠️ No fastlane backup found to restore"
+        fi

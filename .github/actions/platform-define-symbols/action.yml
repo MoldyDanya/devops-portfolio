@@ -1,0 +1,36 @@
+name: 'Platform Define Symbols'
+description: 'Setup platform-specific preprocessor symbols'
+inputs:
+  platform:
+    description: 'Target platform (Android or iOS)'
+    required: true
+  export_debug_symbols:
+    description: 'Whether to export debug symbols'
+    required: false
+    default: 'false'
+  development_build:
+    description: 'Whether to enable development build'
+    required: false
+    default: 'false'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Define Symbols via csc.rsp
+      shell: bash
+      run: |
+        SYMBOLS="CI_CD"
+        
+        # if [ "${{ inputs.development_build }}" == "true" ]; then
+        #   SYMBOLS+=",DEVELOPMENT_BUILD_FLAG"
+        # fi
+        
+        # if [ "${{ inputs.platform }}" == "Android" ] && [ "${{ inputs.export_debug_symbols }}" == "true" ]; then
+        #   SYMBOLS+=",EXPORT_DSYM"
+        # fi
+        
+        echo "-define:$SYMBOLS" > Assets/csc.rsp
+        echo "✅ ${{ inputs.platform }} symbols: $SYMBOLS"
+        
+        echo "📄 Generated csc.rsp:"
+        cat Assets/csc.rsp

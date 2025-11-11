@@ -1,0 +1,49 @@
+name: 'Platform Unity Build Parameters'
+description: 'Generate platform-specific Unity Builder parameters'
+inputs:
+  platform:
+    description: 'Target platform (Android or iOS)'
+    required: true
+  android_build_type:
+    description: 'Android build type (AAB or APK)'
+    required: false
+    default: 'AAB'
+  android_version_code:
+    description: 'Android version code'
+    required: false
+  version:
+    description: 'Version string'
+    required: true
+
+outputs:
+  target_platform:
+    description: 'Unity target platform'
+    value: ${{ steps.params.outputs.target_platform }}
+  android_export_type:
+    description: 'Android export type'
+    value: ${{ steps.params.outputs.android_export_type }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Generate Build Parameters
+      id: params
+      shell: bash
+      run: |
+        if [ "${{ inputs.platform }}" == "Android" ]; then
+          echo "target_platform=Android" >> $GITHUB_OUTPUT
+          
+          # Generate Android export type
+          EXPORT_TYPE="androidAppBundle"
+          if [ "${{ inputs.android_build_type }}" == "APK" ]; then
+            EXPORT_TYPE="androidPackage"
+          fi
+          
+          echo "android_export_type=$EXPORT_TYPE" >> $GITHUB_OUTPUT
+          echo "✅ Android build parameters generated: $EXPORT_TYPE"
+        else
+          # iOS
+          echo "target_platform=iOS" >> $GITHUB_OUTPUT
+          echo "android_export_type=" >> $GITHUB_OUTPUT
+          echo "✅ iOS build parameters generated"
+        fi

@@ -1,0 +1,27 @@
+name: 🌙Nightly build and deploy pipeline
+
+on:
+    schedule:
+        - cron: '0 5 * * *'
+
+jobs:
+    server-maintenance:
+        name: 🧹 Server Maintenance & Startup
+        uses: ./.github/workflows/manage-ec2.yml
+        with:
+            action: maintenance
+        secrets: inherit
+
+    build-deploy-pipeline:
+        needs: [server-maintenance]
+        uses: ./.github/workflows/unity-build-matrix.yml
+        with:
+            branch_name: ${{ github.ref_name }}
+            commit_hash: ${{ github.sha }}
+            android_build_type: 'AAB + Deploy Internal'
+            ios_build_type: 'Build + Deploy Internal'
+            android_release_status: 'Draft'
+            clean_build: false
+        secrets: inherit
+    
+    

@@ -1,0 +1,230 @@
+name: 'Unity Test Runner with Permissions Fix'
+
+description: 'Runs Unity tests and fixes permissions afterwards'
+
+inputs:
+  unity_email:
+    description: 'Unity email for license activation'
+    required: true
+  unity_password:
+    description: 'Unity password for license activation'
+    required: true
+  unity_serial:
+    description: 'Unity serial number for license activation'
+    required: true
+  github_token:
+    description: 'GitHub token for test runner'
+    required: true
+  username:
+    description: 'Username to set as owner for permissions'
+    required: true
+  run_as_host_user:
+    description: 'Whether to run as host user'
+    required: false
+    default: 'true'
+  project_path:
+    description: 'Path to the Unity project'
+    required: false
+    default: '.'
+  test_mode:
+    description: 'Test mode to run tests in'
+    required: false
+    default: 'all'
+  extra_parameters:
+    description: 'Additional parameters for Unity test runner'
+    required: false
+    default: ''
+  alttester_license_key:
+    description: 'AltTester license key'
+    required: true
+
+outputs:
+  artifacts_path:
+    description: 'Path to the test artifacts'
+    value: ${{ steps.test_runner.outputs.artifactsPath }}
+  test_results:
+    description: 'Path to the test results'
+    value: ${{ steps.test_runner.outputs.testResults }}
+  coverage_results:
+    description: 'Path to the coverage results'
+    value: ${{ steps.test_runner.outputs.coverageResults }}
+  outcome:
+    description: 'Outcome of the test run'
+    value: ${{ steps.test_runner.outcome }}
+
+runs:
+  using: 'composite'
+
+  steps:
+    # - name: Validate License Key
+    #   shell: bash
+    #   run: |
+    #     # Safely store license key in a variable with proper quoting
+    #     LICENSE_KEY='${{ inputs.alttester_license_key }}'
+        
+    #     # Check if license key is provided
+    #     if [ -z "$LICENSE_KEY" ]; then
+    #       echo "Error: AltTester license key is empty!"
+    #       exit 1
+    #     else
+    #       # Calculate key length safely using wc instead of ${#KEY}
+    #       KEY_LENGTH=$(echo -n "$LICENSE_KEY" | wc -c)
+    #       echo "AltTester license key is provided (length: $KEY_LENGTH characters)"
+    #     fi
+
+    # Install required tools for diagnostics
+    - name: Install diagnostic tools
+      shell: bash
+      run: |
+        if ! command -v jq &> /dev/null; then
+          echo "Installing jq for diagnostics..."
+          sudo apt-get update && sudo apt-get install -y jq
+        fi
+        if ! command -v lsof &> /dev/null; then
+          echo "Installing lsof for port diagnostics..."
+          sudo apt-get update && sudo apt-get install -y lsof
+        fi
+
+    # Run AltTester container with license key
+    - name: Run AltTester Docker
+      uses: addnab/docker-run-action@v3
+      with:
+        image: alttestertools/alttester:2.0.1  # Using specific version instead of latest
+        options: -d -p 13000:13000 --name alttester-container -e ALTTESTER_LICENSE_KEY=${{ inputs.alttester_license_key }}
+
+    # Enhanced diagnostics for AltTester container
+    - name: AltTester Container Diagnostics
+      shell: bash
+      run: |
+        # Define license key variable for script use
+        export LICENSE_KEY="${{ inputs.alttester_license_key }}"
+        
+        # Initial delay to let container initialize
+        echo "Waiting for container initialization..."
+        sleep 5
+        
+        # Container status check
+        CONTAINER_STATUS=$(docker inspect -f '{{.State.Status}}' alttester-container 2>/dev/null)
+        echo "Container status: $CONTAINER_STATUS"
+        
+        # Exit code if container stopped
+        if [ "$CONTAINER_STATUS" != "running" ]; then
+          EXIT_CODE=$(docker inspect -f '{{.State.ExitCode}}' alttester-container 2>/dev/null)
+          echo "Container exit code: $EXIT_CODE"
+          
+          # Container error message if any
+          ERROR_MSG=$(docker inspect -f '{{.State.Error}}' alttester-container 2>/dev/null)
+          if [ ! -z "$ERROR_MSG" ]; then
+            echo "Container error message: $ERROR_MSG"
+          fi
+        fi
+        
+        # Container logs (even if stopped)
+        echo "Container logs:"
+        docker logs alttester-container 2>&1
+        
+        # Check network configuration
+        echo "Container network configuration:"
+        docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}: {{$v.IPAddress}}{{end}}' alttester-container 2>/dev/null || echo "Network info not available"
+        
+        # Check port bindings
+        echo "Port bindings:"
+        docker port alttester-container 2>/dev/null || echo "No port mappings or container not running"
+        
+        # Check port availability on host
+        echo "Checking if port 13000 is free on host:"
+        lsof -i :13000 || echo "Port 13000 is available"
+        
+        # Check license key format (safely - only showing length)
+        if [ ! -z "$LICENSE_KEY" ]; then
+          LICENSE_LENGTH=${#LICENSE_KEY}
+          echo "License key length: $LICENSE_LENGTH characters"
+        else
+          echo "Warning: License key is empty in verification step"
+        fi
+        
+        # Check container environment variables
+        echo "Container environment variables:"
+        docker exec alttester-container env 2>/dev/null | grep -i license || echo "Cannot inspect container environment - container not running"
+        
+        # If container exited, attempt to restart with debug mode
+        if [ "$CONTAINER_STATUS" != "running" ]; then
+          echo "Attempting to restart container with debug mode..."
+          docker run -d -p 13000:13000 --name alttester-debug -e ALTTESTER_LICENSE_KEY=${{ inputs.alttester_license_key }} -e ALTTESTER_DEBUG=true alttestertools/alttester:2.0.1
+          sleep 5
+          echo "Debug container logs:"
+          docker logs alttester-debug
+          docker stop alttester-debug && docker rm alttester-debug
+        fi
+
+    # Verify AltTester is running with additional retries
+    - name: Verify AltTester Status
+      shell: bash
+      run: |
+        MAX_RETRIES=3
+        RETRY_COUNT=0
+        
+        while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+          if docker inspect -f '{{.State.Status}}' alttester-container 2>/dev/null | grep -q "running"; then
+            echo "✅ AltTester container is running"
+            break
+          else
+            RETRY_COUNT=$((RETRY_COUNT+1))
+            if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+              echo "Error: AltTester container failed to start after $MAX_RETRIES attempts"
+              exit 1
+            fi
+            echo "Container not running, restarting (attempt $RETRY_COUNT/$MAX_RETRIES)..."
+            docker start alttester-container
+            sleep 10
+          fi
+        done
+        
+        # Test API connection
+        RETRY_COUNT=0
+        while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+          if curl -s -o /dev/null -w "%{http_code}" http://localhost:13000/health 2>/dev/null | grep -q "200"; then
+            echo "✅ AltTester API is operational"
+            break
+          else
+            RETRY_COUNT=$((RETRY_COUNT+1))
+            if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+              echo "Error: AltTester API is not responding after $MAX_RETRIES attempts"
+              exit 1
+            fi
+            echo "Waiting for AltTester API (attempt $RETRY_COUNT/$MAX_RETRIES)..."
+            sleep 5
+          fi
+        done
+
+    # Uncomment when ready to run tests
+    # - name: Run Unity Tests
+    #   uses: game-ci/unity-test-runner@v4
+    #   id: test_runner
+    #   env:
+    #     UNITY_EMAIL: ${{ inputs.unity_email }}
+    #     UNITY_PASSWORD: ${{ inputs.unity_password }}
+    #     UNITY_SERIAL: ${{ inputs.unity_serial }}
+    #   with:
+    #     githubToken: ${{ inputs.github_token }}
+    #     chownFilesTo: ${{ inputs.username }}
+    #     runAsHostUser: ${{ inputs.run_as_host_user }}
+    #     projectPath: ${{ inputs.project_path }}
+    #     testMode: ${{ inputs.test_mode }}
+    #     customParameters: ${{ inputs.extra_parameters }}
+
+    # Cleanup
+    - name: Stop AltTester Docker Container
+      if: always()
+      uses: addnab/docker-run-action@v3
+      with:
+        image: docker
+        options: --network host --privileged
+        run: docker stop alttester-container && docker rm alttester-container
+
+    # Fix permissions
+    - name: Fix permissions
+      if: always()
+      uses: ./.github/actions/fix-permissions
+      with:
+        username: ${{ inputs.username }}

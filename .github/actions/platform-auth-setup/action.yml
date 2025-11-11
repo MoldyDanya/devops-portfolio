@@ -1,0 +1,37 @@
+name: 'Platform Authentication Setup'
+description: 'Setup platform-specific authentication and tools'
+inputs:
+  platform:
+    description: 'Target platform (Android or iOS)'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Android Authentication Setup
+      if: inputs.platform == 'Android'
+      shell: bash
+      run: |
+        # Create Fastlane Directory
+        GOOGLE_PLAY_KEY_FILE_PATH="${{ format('{0}/fastlane/google-fastlane.json', github.workspace) }}"
+        mkdir -p $(dirname "$GOOGLE_PLAY_KEY_FILE_PATH")
+        
+        # Add Authentication
+        echo "$GOOGLE_PLAY_KEY_FILE" > "$GOOGLE_PLAY_KEY_FILE_PATH"
+        echo "✅ Google Play authentication configured"
+        
+        # Export path for subsequent steps
+        echo "GOOGLE_PLAY_KEY_FILE_PATH=$GOOGLE_PLAY_KEY_FILE_PATH" >> $GITHUB_ENV
+
+    - name: Set up Fastlane (Ruby)
+      if: inputs.platform == 'Android'
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: 3.2
+        bundler-cache: true
+        
+    - name: iOS Authentication Setup
+      if: inputs.platform == 'iOS'
+      shell: bash
+      run: |
+        echo "✅ iOS platform - no additional authentication setup required"

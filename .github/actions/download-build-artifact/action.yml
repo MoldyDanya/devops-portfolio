@@ -1,0 +1,211 @@
+name: 'Download Build Artifact'
+description: 'Downloads build artifacts with fallback logic for specific run ID'
+
+inputs:
+  artifact-name:
+    description: 'Name of the artifact to download'
+    required: true
+  destination-path:
+    description: 'Path where to download the artifact'
+    required: true
+  workflow-filename:
+    description: 'Workflow filename to search for latest successful run'
+    required: true
+  specific-run-id:
+    description: 'Specific run ID to try first'
+    required: false
+    default: ''
+  github-token:
+    description: 'GitHub token for API access'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Initialize download process
+      shell: bash
+      run: |
+        echo "::group::INITIALIZATION"
+        echo "Download artifact process started"
+        echo "Artifact name: ${{ inputs.artifact-name }}"
+        echo "Destination path: ${{ inputs.destination-path }}"
+        echo "Workflow filename: ${{ inputs.workflow-filename }}"
+        echo "Specific run ID: ${{ inputs.specific-run-id || 'not specified' }}"
+        echo "::endgroup::"
+        
+        # Initialize summary
+        echo "## Artifact Download Process" >> $GITHUB_STEP_SUMMARY
+        echo "**Artifact:** \`${{ inputs.artifact-name }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Destination:** \`${{ inputs.destination-path }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Workflow:** \`${{ inputs.workflow-filename }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Specific Run ID:** \`${{ inputs.specific-run-id || 'not specified' }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "### Download Steps" >> $GITHUB_STEP_SUMMARY
+
+    - name: Download artifact from current run
+      uses: actions/download-artifact@v4 
+      continue-on-error: true
+      id: download_current
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ inputs.destination-path }}
+
+    - name: Evaluate current run download status
+      shell: bash
+      run: |
+        echo "::group::CURRENT RUN DOWNLOAD STATUS"
+        if [ "${{ steps.download_current.outcome }}" == "success" ]; then
+          echo "STATUS: Artifact successfully downloaded from current run"
+          echo "RESULT: SUCCESS"
+          echo "✅ **Current Run:** Artifact successfully downloaded" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "STATUS: Failed to download artifact from current run"
+          echo "RESULT: FAILURE - Will try fallback options"
+          echo "❌ **Current Run:** Failed to download artifact" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "::endgroup::"
+
+    - name: Check specific run ID
+      if: steps.download_current.outcome == 'failure' && inputs.specific-run-id != ''
+      id: check_specific_run
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        echo "::group::CHECKING SPECIFIC RUN ID"
+        echo "STATUS: Validating specific run ID: ${{ inputs.specific-run-id }}"
+        
+        RUN_EXISTS=$(gh run view ${{ inputs.specific-run-id }} --json status --jq '.status' 2>/dev/null || echo "not_found")
+        echo "Run status check result: $RUN_EXISTS"
+        
+        if [ "$RUN_EXISTS" != "not_found" ] && [ "$RUN_EXISTS" = "completed" ]; then
+          echo "STATUS: Run exists and is completed. Checking for artifact..."
+          
+          ARTIFACT_EXISTS=$(gh run download ${{ inputs.specific-run-id }} -n "${{ inputs.artifact-name }}" -D /tmp/check_artifact 2>/dev/null && echo "found" || echo "not_found")
+          echo "Artifact check result: $ARTIFACT_EXISTS"
+          
+          if [ "$ARTIFACT_EXISTS" = "found" ]; then
+            echo "run_id=${{ inputs.specific-run-id }}" >> $GITHUB_OUTPUT
+            echo "valid_run=true" >> $GITHUB_OUTPUT
+            echo "RESULT: VALID - Found artifact in specified run"
+            echo "✅ **Specific Run Validation:** Run ID ${{ inputs.specific-run-id }} is valid and contains the artifact" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "valid_run=false" >> $GITHUB_OUTPUT
+            echo "RESULT: INVALID - Artifact not found in specified run ID: ${{ inputs.specific-run-id }}"
+            echo "❌ **Specific Run Validation:** Artifact not found in Run ID ${{ inputs.specific-run-id }}" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "valid_run=false" >> $GITHUB_OUTPUT
+          echo "RESULT: INVALID - Run ID not found or not completed: ${{ inputs.specific-run-id }}"
+          echo "❌ **Specific Run Validation:** Run ID ${{ inputs.specific-run-id }} not found or not completed" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "::endgroup::"
+
+    - name: Get Latest Run ID
+      if: steps.download_current.outcome == 'failure' && (inputs.specific-run-id == '' || steps.check_specific_run.outputs.valid_run != 'true')
+      id: get-run 
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        echo "::group::FINDING LATEST SUCCESSFUL RUN"
+        echo "STATUS: Searching for latest successful run of workflow: ${{ inputs.workflow-filename }}"
+        
+        RUN_ID=$(gh run list --workflow "${{ inputs.workflow-filename }}" --status success --json databaseId --jq '.[0].databaseId')
+        
+        if [ -n "$RUN_ID" ]; then
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "RESULT: SUCCESS - Found latest successful run ID: $RUN_ID"
+          echo "✅ **Latest Run Search:** Found successful run ID: $RUN_ID" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "RESULT: FAILURE - No successful runs found for workflow: ${{ inputs.workflow-filename }}"
+          echo "❌ **Latest Run Search:** No successful runs found" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "::endgroup::"
+
+    - name: Download artifact from specific run
+      if: steps.download_current.outcome == 'failure' && steps.check_specific_run.outputs.valid_run == 'true'
+      id: download_from_specific
+      continue-on-error: true
+      shell: bash
+      run: |
+        echo "::group::DOWNLOADING FROM SPECIFIC RUN"
+        echo "STATUS: Attempting to download from specified run ID: ${{ steps.check_specific_run.outputs.run_id }}"
+        echo "::endgroup::"
+
+    - name: Execute download from specific run
+      if: steps.download_current.outcome == 'failure' && steps.check_specific_run.outputs.valid_run == 'true'
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ inputs.destination-path }}
+        github-token: ${{ inputs.github-token }}
+        run-id: ${{ steps.check_specific_run.outputs.run_id }}
+
+    - name: Log specific run download results
+      if: steps.download_current.outcome == 'failure' && steps.check_specific_run.outputs.valid_run == 'true'
+      shell: bash
+      run: |
+        echo "::group::SPECIFIC RUN DOWNLOAD RESULTS"
+        echo "STATUS: Download from specific run ID completed"
+        echo "RESULT: SUCCESS - Artifact downloaded from specified run ID: ${{ steps.check_specific_run.outputs.run_id }}"
+        echo "✅ **Specific Run Download:** Successfully downloaded artifact from Run ID ${{ steps.check_specific_run.outputs.run_id }}" >> $GITHUB_STEP_SUMMARY
+        echo "::endgroup::"
+
+    - name: Download artifact from latest run
+      if: steps.download_current.outcome == 'failure' && (inputs.specific-run-id == '' || steps.check_specific_run.outputs.valid_run != 'true')
+      id: download_from_latest
+      continue-on-error: true
+      shell: bash
+      run: |
+        echo "::group::DOWNLOADING FROM LATEST RUN"
+        echo "STATUS: Attempting to download from latest successful run ID: ${{ steps.get-run.outputs.run_id }}"
+        echo "::endgroup::"
+
+    - name: Execute download from latest run
+      if: steps.download_current.outcome == 'failure' && (inputs.specific-run-id == '' || steps.check_specific_run.outputs.valid_run != 'true')
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ inputs.destination-path }}
+        github-token: ${{ inputs.github-token }}
+        run-id: ${{ steps.get-run.outputs.run_id }}
+
+    - name: Log latest run download results
+      if: steps.download_current.outcome == 'failure' && (inputs.specific-run-id == '' || steps.check_specific_run.outputs.valid_run != 'true')
+      shell: bash
+      run: |
+        echo "::group::LATEST RUN DOWNLOAD RESULTS"
+        echo "STATUS: Download from latest run ID completed" 
+        echo "RESULT: SUCCESS - Artifact downloaded from latest run ID: ${{ steps.get-run.outputs.run_id }}"
+        echo "✅ **Latest Run Download:** Successfully downloaded artifact from Run ID ${{ steps.get-run.outputs.run_id }}" >> $GITHUB_STEP_SUMMARY
+        echo "::endgroup::"
+
+    - name: Summarize download process
+      shell: bash
+      run: |
+        echo "::group::DOWNLOAD PROCESS SUMMARY"
+        if [ "${{ steps.download_current.outcome }}" == "success" ]; then
+          echo "SUCCESS: Artifact downloaded from current run"
+          echo "### ✅ Final Result: SUCCESS" >> $GITHUB_STEP_SUMMARY
+          echo "Artifact \`${{ inputs.artifact-name }}\` successfully downloaded from current run" >> $GITHUB_STEP_SUMMARY
+        elif [ "${{ steps.check_specific_run.outputs.valid_run }}" == "true" ]; then
+          echo "SUCCESS: Artifact downloaded from specified run ID: ${{ steps.check_specific_run.outputs.run_id }}"
+          echo "### ✅ Final Result: SUCCESS" >> $GITHUB_STEP_SUMMARY
+          echo "Artifact \`${{ inputs.artifact-name }}\` successfully downloaded from specified Run ID: \`${{ steps.check_specific_run.outputs.run_id }}\`" >> $GITHUB_STEP_SUMMARY
+        elif [ -n "${{ steps.get-run.outputs.run_id }}" ]; then
+          echo "SUCCESS: Artifact downloaded from latest successful run ID: ${{ steps.get-run.outputs.run_id }}"
+          echo "### ✅ Final Result: SUCCESS" >> $GITHUB_STEP_SUMMARY
+          echo "Artifact \`${{ inputs.artifact-name }}\` successfully downloaded from latest successful Run ID: \`${{ steps.get-run.outputs.run_id }}\`" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "FAILURE: Unable to download artifact from any source"
+          echo "### ❌ Final Result: FAILURE" >> $GITHUB_STEP_SUMMARY
+          echo "**Unable to download artifact** \`${{ inputs.artifact-name }}\` from any source" >> $GITHUB_STEP_SUMMARY
+          echo "Attempted sources:" >> $GITHUB_STEP_SUMMARY
+          echo "- Current run" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ inputs.specific-run-id }}" ]; then
+            echo "- Specified Run ID: \`${{ inputs.specific-run-id }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "- Latest successful run of workflow: \`${{ inputs.workflow-filename }}\`" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "::endgroup::"

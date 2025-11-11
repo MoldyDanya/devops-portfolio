@@ -1,0 +1,282 @@
+name: Manage ec2 instance (start/stop/maintenance)
+run-name: ${{ inputs.action == 'start' && format('Starting EC2{0}', inputs.delay != '0' && format(' with {0}s delay', inputs.delay) || '') || inputs.action == 'stop' && format('Stopping EC2{0}', inputs.delay != '0' && format(' with {0}s delay', inputs.delay) || '') || inputs.action == 'maintenance' && '🧹 EC2 Maintenance & Cleanup' || 'Managing EC2' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        required: true
+        description: "Action to perform (start/stop/maintenance)"
+        default: "start"
+        type: choice
+        options: 
+          - start 
+          - stop
+          - maintenance
+      delay:
+        description: "Delay in seconds before action"
+        required: false
+        default: "0"
+        type: string
+  workflow_call:
+    inputs:
+      action:
+        type: string
+        required: false
+        description: "Action to perform (start/stop/maintenance)"
+        default: "start"
+      delay:
+        type: string
+        required: false
+        description: "Delay in seconds before action"
+        default: "0"
+
+concurrency:
+  group: ec2-management-${{ inputs.instance_id }}
+  cancel-in-progress: false
+
+jobs:
+  manage-ec2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - name: Wait ${{ inputs.delay }} seconds if delay specified
+      if: inputs.delay != '0'
+      run: sleep ${{ inputs.delay }}
+
+    - name: Configure AWS
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Check Instance State
+      id: check-state
+      run: |
+        instance_id="${{ vars.AWS_INSTANCE_ID }}"
+        STATE=$(aws ec2 describe-instances \
+          --instance-ids $instance_id \
+          --query 'Reservations[0].Instances[0].State.Name' \
+          --output text)
+        echo "Current state: $STATE"
+        echo "instance_state=$STATE" >> $GITHUB_OUTPUT
+    
+    - name: Start Instance
+      if: inputs.action == 'start'
+      run: |
+        instance_id="${{ vars.AWS_INSTANCE_ID }}"
+        wait_time=20
+        case "${{ steps.check-state.outputs.instance_state }}" in
+          "running")
+            echo "Instance is already running"
+            ;;
+          "pending")
+            echo "Instance is already in the process of starting"
+            ;;
+          "stopping")
+            max_attempts=15
+            attempt=0
+            while [ $attempt -le $max_attempts ]; do
+              echo "Attempt $attempt of $max_attempts: Instance is stopping. Waiting $wait_time seconds..."
+              sleep $wait_time
+              
+              STATE=$(aws ec2 describe-instances \
+                --instance-ids $instance_id \
+                --query 'Reservations[0].Instances[0].State.Name' \
+                --output text)
+                
+              if [ "$STATE" == "stopped" ]; then
+                aws ec2 start-instances --instance-ids $instance_id
+                echo "Successfully initiated start for instance $instance_id"
+                break
+              fi
+              
+              if [ $attempt == $max_attempts ]; then
+                echo "Max attempts reached. Instance still stopping."
+                exit 1
+              fi
+              
+              attempt=$((attempt + 1))
+            done
+            ;;
+          "shutting-down")
+            echo "Cannot start instance that is shutting down"
+            exit 1
+            ;;
+          "terminated")
+            echo "Cannot start terminated instance"
+            exit 1
+            ;;
+          "stopped")
+            aws ec2 start-instances --instance-ids $instance_id
+            echo "Successfully initiated start for instance $instance_id"
+            ;;
+          *)
+            echo "Unknown instance state: ${{ steps.check-state.outputs.instance_state }}"
+            exit 1
+            ;;
+        esac
+        
+    - name: Stop Instance
+      if: inputs.action == 'stop'
+      run: |
+        instance_id="${{ vars.AWS_INSTANCE_ID }}"
+        case "${{ steps.check-state.outputs.instance_state }}" in
+          "stopped")
+            echo "Instance is already stopped"
+            ;;
+          "stopping")
+            echo "Instance is already in the process of stopping"
+            ;;
+          "shutting-down")
+            echo "Instance is already shutting down"
+            ;;
+          "terminated")
+            echo "Cannot stop terminated instance"
+            exit 1
+            ;;
+          "pending")
+            echo "Cannot stop instance while it is starting. Please wait and try again."
+            exit 1
+            ;;
+          "running")
+            aws ec2 stop-instances --instance-ids $instance_id
+            echo "Successfully initiated stop for instance $instance_id"
+            ;;
+          *)
+            echo "Unknown instance state: ${{ steps.check-state.outputs.instance_state }}"
+            exit 1
+            ;;
+        esac
+
+    - name: Maintenance Mode (Start + Cleanup)
+      if: inputs.action == 'maintenance'
+      run: |
+        instance_id="${{ vars.AWS_INSTANCE_ID }}"
+        wait_time=20
+        
+        echo "🚀 Starting maintenance mode for instance $instance_id"
+        
+        # First, start the instance (same logic as start action)
+        case "${{ steps.check-state.outputs.instance_state }}" in
+          "running")
+            echo "✅ Instance is already running"
+            ;;
+          "pending")
+            echo "⏳ Instance is already starting"
+            ;;
+          "stopping")
+            max_attempts=15
+            attempt=0
+            while [ $attempt -le $max_attempts ]; do
+              echo "⏳ Attempt $attempt of $max_attempts: Instance is stopping. Waiting $wait_time seconds..."
+              sleep $wait_time
+              
+              STATE=$(aws ec2 describe-instances \
+                --instance-ids $instance_id \
+                --query 'Reservations[0].Instances[0].State.Name' \
+                --output text)
+                
+              if [ "$STATE" == "stopped" ]; then
+                aws ec2 start-instances --instance-ids $instance_id
+                echo "🚀 Successfully initiated start for instance $instance_id"
+                break
+              fi
+              
+              if [ $attempt == $max_attempts ]; then
+                echo "❌ Max attempts reached. Instance still stopping."
+                exit 1
+              fi
+              
+              attempt=$((attempt + 1))
+            done
+            ;;
+          "stopped")
+            aws ec2 start-instances --instance-ids $instance_id
+            echo "🚀 Successfully initiated start for instance $instance_id"
+            ;;
+          *)
+            echo "❌ Cannot perform maintenance on instance in state: ${{ steps.check-state.outputs.instance_state }}"
+            exit 1
+            ;;
+        esac
+        
+        echo "✅ Instance start completed. Maintenance mode will continue with cleanup once instance is fully running."
+
+    - name: Wait for Instance Running (Maintenance)
+      if: inputs.action == 'maintenance'
+      run: |
+        instance_id="${{ vars.AWS_INSTANCE_ID }}"
+        max_attempts=30
+        attempt=0
+        wait_time=10
+        
+        echo "⏳ Waiting for instance to be fully running before cleanup..."
+        
+        while [ $attempt -le $max_attempts ]; do
+          STATE=$(aws ec2 describe-instances \
+            --instance-ids $instance_id \
+            --query 'Reservations[0].Instances[0].State.Name' \
+            --output text)
+          
+          STATUS_CHECK=$(aws ec2 describe-instance-status \
+            --instance-ids $instance_id \
+            --query 'InstanceStatuses[0].SystemStatus.Status' \
+            --output text 2>/dev/null || echo "not-available")
+          
+          echo "Instance state: $STATE, System status: $STATUS_CHECK"
+          
+          if [ "$STATE" == "running" ] && [ "$STATUS_CHECK" == "ok" ]; then
+            echo "✅ Instance is fully running and ready for cleanup"
+            break
+          fi
+          
+          if [ $attempt == $max_attempts ]; then
+            echo "⚠️ Instance might not be fully ready, but proceeding with maintenance"
+            break
+          fi
+          
+          echo "⏳ Waiting $wait_time seconds... (attempt $((attempt + 1)) of $((max_attempts + 1)))"
+          sleep $wait_time
+          attempt=$((attempt + 1))
+        done
+
+    - name: Maintenance Completed
+      if: inputs.action == 'maintenance'
+      run: |
+        echo "✅ Server started successfully"
+        echo "🧹 Docker cleanup will be performed in separate job"
+
+  docker-cleanup:
+    if: inputs.action == 'maintenance'
+    needs: [manage-ec2]
+    runs-on: 
+      - self-hosted
+      - ${{ github.event.repository.name }}
+      - build
+    steps:
+      - name: Check disk space before cleanup
+        run: |
+          echo "💾 Disk space before cleanup:"
+          df -h
+          echo ""
+          echo "🐳 Docker usage before cleanup:"
+          docker system df
+
+      - name: Docker cleanup
+        run: |
+          echo "🧹 Running Docker system cleanup..."
+          docker system prune -a --force
+          echo "✅ Docker cleanup completed"
+
+      - name: Check disk space after cleanup
+        run: |
+          echo ""
+          echo "💾 Disk space after cleanup:"
+          df -h
+          echo ""
+          echo "🐳 Docker usage after cleanup:"
+          docker system df
+          echo ""
+          echo "✅ Maintenance completed successfully!"

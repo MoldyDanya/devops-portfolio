@@ -1,0 +1,64 @@
+name: Android IAS Upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      self_hosted:
+        description: 'Run on self-hosted runner'
+        type: boolean
+        default: false
+      specific_run_id:
+        description: 'Run ID to download artifact from (optional)'
+        type: string
+        required: false
+      generate_ias_link:
+        description: 'Generate Internal App Sharing link'
+        type: boolean
+        default: true
+        required: false
+  workflow_call:
+    inputs:
+      self_hosted:
+        type: boolean
+        default: false
+      specific_run_id:
+        type: string
+        required: false
+      generate_ias_link:
+        description: 'Generate Internal App Sharing link'
+        type: boolean
+        default: true
+        required: false
+
+jobs:
+  generate-internal-sharing-link:
+    name: Generate Internal App Sharing Link
+    if: inputs.generate_ias_link
+    runs-on: ${{ inputs.self_hosted && 'self-hosted' || 'ubuntu-latest' }}
+    outputs:
+      ias_url: ${{ steps.upload_internal_sharing.outputs.download-url }}
+      package_name: ${{ steps.upload_internal_sharing.outputs.package-name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/actions
+
+      - name: Download Android artifact
+        uses: ./.github/actions/download-build-artifact
+        with:
+          artifact-name: build-Android
+          destination-path: build/Android
+          workflow-filename: unity-build-matrix.yml
+          specific-run-id: ${{ inputs.specific_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Upload to Internal App Sharing
+        id: upload_internal_sharing
+        uses: ./.github/actions/upload-internal-sharing
+        with:
+          aab-path: ${{ github.workspace }}/build/Android/Android.aab
+          package-name: ${{ secrets.ANDROID_PACKAGE_NAME }}
+          service-account-json: ${{ secrets.GOOGLE_PLAY_KEY_FILE }}
+
