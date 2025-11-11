@@ -1,0 +1,1152 @@
+lane :get_android_version_code do |options|
+  git_based_version = options[:version]
+  target_track = options[:track] || 'internal'
+  
+  UI.message("🤖 Android Store Deployment Version Calculation")
+  UI.message("🏷️  Git-based version: #{git_based_version}")
+  UI.message("🎯 Target deploy track: #{target_track}")
+  
+  supply_config = {
+    package_name: ENV['ANDROID_PACKAGE_NAME'],
+    json_key: ENV['GOOGLE_PLAY_KEY_FILE_PATH']
+  }
+  
+  # Always check Google Play versions for store deployment
+  UI.message("📱 Checking Google Play versions (store deployment)")
+  final_version_name = calculate_final_android_version(git_based_version, supply_config)
+  
+  UI.success("🎯 Final version name to use: #{final_version_name}")
+  
+  base_number = calculate_build_number(final_version_name)
+  UI.message("🔢 Base build number calculated: #{base_number}")
+  
+  # Get version codes from all tracks
+  tracks = ['internal', 'alpha', 'beta', 'production']
+  latest_codes = tracks.map do |track|
+    track_config = supply_config.merge(track: track)
+    codes = google_play_track_version_codes(track_config) rescue []
+    max_code = codes.max || 0
+    UI.message("📊 Latest version code in #{track} track: #{max_code}")
+    max_code
+  end
+  
+  latest_code = latest_codes.max || 0
+  UI.message("📈 Highest version code across all tracks: #{latest_code}")
+  
+  final_version_code = get_next_available_build_number(base_number, latest_code)
+  UI.success("🚀 Final version code to use: #{final_version_code}")
+  
+  # Also output the individual components for backwards compatibility
+  sh "echo \"version=#{final_version_code}\" >> $GITHUB_OUTPUT"
+  sh "echo \"version_name=#{final_version_name}\" >> $GITHUB_OUTPUT" 
+  sh "echo \"version_code=#{final_version_code}\" >> $GITHUB_OUTPUT"
+end
+
+lane :get_ios_final_version do |options|
+  git_based_version = options[:version]
+  
+  UI.message("🍏 iOS Store Deployment Version Calculation")
+  UI.message("🏷️  Git-based version: #{git_based_version}")
+  
+  # Always check App Store versions for store deployment
+  UI.message("📱 Checking App Store Connect versions (store deployment)")
+  final_version = calculate_final_version(git_based_version)
+  
+  UI.success("🎯 Final iOS version to use: #{final_version}")
+  
+  sh "echo \"final_version=#{final_version}\" >> $GITHUB_OUTPUT"
+end
+
+lane :get_internal_sharing_link do |options|
+  aab_path = options[:aab_path]
+
+  puts "Uploading #{aab_path} to Internal App Sharing..."
+
+  download_url = upload_to_play_store_internal_app_sharing(
+    aab: aab_path,
+    package_name: ENV['ANDROID_PACKAGE_NAME'],
+    json_key: ENV['GOOGLE_PLAY_KEY_FILE_PATH']
+  )
+
+  puts "Successfully generated Internal App Sharing link: #{download_url}"
+  
+  # Using modern GitHub Actions output format instead of deprecated ::set-output
+  sh "echo \"url=#{download_url}\" >> $GITHUB_OUTPUT"
+  
+  download_url
+end
+
+def calculate_build_number(version)
+  version_parts = version.split(".")
+  major = version_parts[0].to_i
+  minor = version_parts[1].to_i
+  patch = version_parts[2].to_i
+  base_number = (major * 1000000) + (minor * 1000) + patch
+  base_number
+end
+
+def get_next_available_build_number(base_number, latest_store_build)
+  return base_number if latest_store_build.nil? || latest_store_build < base_number
+
+  current_iteration = latest_store_build % 10
+  base = (latest_store_build / 10) * 10
+  base + current_iteration + 1
+end
+
+def get_latest_google_play_version_names(supply_config)
+  begin
+    UI.message("🔍 Fetching latest version names from Google Play Console...")
+    
+    tracks = ['internal', 'alpha', 'beta', 'production']
+    version_names = []
+    
+    tracks.each do |track|
+      begin
+        track_config = supply_config.merge(track: track)
+        
+        # Get releases for this track
+        releases = google_play_track_releases(track_config) rescue []
+        
+        releases.each do |release|
+          if release.version_codes && release.version_codes.any?
+            # Get version name for this release
+            version_name = release.name
+            if version_name && !version_name.empty?
+              version_names << version_name
+              UI.message("📱 Found version #{version_name} in #{track} track")
+            end
+          end
+        end
+      rescue => e
+        UI.important("⚠️  Could not fetch releases from #{track} track: #{e.message}")
+      end
+    end
+    
+    return version_names.uniq.sort { |a, b| Gem::Version.new(b) <=> Gem::Version.new(a) }
+    
+  rescue => e
+    UI.error("❌ Error fetching Google Play version names: #{e.message}")
+    UI.verbose("Full error details: #{e.backtrace.join("\n")}")
+    return []
+  end
+end
+
+def calculate_final_android_version(git_based_version, supply_config)
+  UI.message("🔄 Starting Android version calculation process...")
+  UI.message("📋 Git-based version: #{git_based_version}")
+  
+  # Get latest version names from Google Play
+  play_store_versions = get_latest_google_play_version_names(supply_config)
+  
+  if play_store_versions.empty?
+    UI.message("📦 Using git-based version (no Google Play versions found): #{git_based_version}")
+    return git_based_version
+  end
+  
+  highest_play_store_version = play_store_versions.first
+  UI.message("📱 Highest Google Play version: #{highest_play_store_version}")
+  
+  # Compare versions
+  begin
+    if Gem::Version.new(git_based_version) > Gem::Version.new(highest_play_store_version)
+      UI.success("✅ Git version (#{git_based_version}) > Google Play version (#{highest_play_store_version})")
+      UI.message("📦 Using git-based version: #{git_based_version}")
+      return git_based_version
+    else
+      # Google Play version is higher or equal, increment it
+      UI.important("⚠️  Google Play version (#{highest_play_store_version}) >= Git version (#{git_based_version})")
+      
+      # Parse Google Play version and increment
+      version_parts = highest_play_store_version.split(".")
+      major = version_parts[0].to_i
+      minor = version_parts[1].to_i
+      patch = version_parts[2] ? version_parts[2].to_i : 0
+      
+      # Increment patch version
+      patch += 1
+      new_version = "#{major}.#{minor}.#{patch}"
+      
+      UI.success("🔄 Incremented Google Play version: #{highest_play_store_version} → #{new_version}")
+      UI.message("📦 Using incremented version: #{new_version}")
+      return new_version
+    end
+  rescue ArgumentError => e
+    UI.error("❌ Error comparing versions: #{e.message}")
+    UI.message("📦 Falling back to git-based version: #{git_based_version}")
+    return git_based_version
+  end
+end
+
+platform :android do
+    desc "Beta track upload with status options"
+    lane :beta do
+        upload_buid('beta')
+    end
+
+    desc "Internal track upload with status options"
+    lane :internal do
+        upload_buid('internal')
+    end
+
+    desc "Download universal APK from Google Play Store"
+    lane :download_apk do |options|
+      download_universal_apk_from_google_play(
+        package_name: ENV['ANDROID_PACKAGE_NAME'],
+        json_key: ENV['GOOGLE_PLAY_KEY_FILE_PATH'],
+        version_code: options[:version_code],
+        destination: "./apk_output/universal-#{options[:version_code]}.apk"
+      )
+    end
+
+    def upload_buid(track)
+        version_name = fetch_version()
+        version_code = fetch_version_code()
+        
+        use_default_changelog = ENV['USE_DEFAULT_CHANGELOG']&.downcase == 'true'
+        
+        unless android_get_changelog('n', use_default_changelog)
+          UI.user_error!("Failed to create changelog files")
+        end
+
+      params = {
+        version_name: "#{version_code} (#{version_name})",
+        aab: "#{ENV['ANDROID_BUILD_FILE_PATH']}",
+        track: track,
+        release_status: ENV['RELEASE_STATUS']
+      }
+
+      export_debug_symbols = ENV['EXPORT_DEBUG_SYMBOLS']&.downcase == 'true'
+      if export_debug_symbols
+        symbols_files = Dir.glob(ENV['ANDROID_DEBUG_SYMBOLS_PATTERN'])
+        unless symbols_files.empty?
+          UI.message("Found debug symbols: #{symbols_files}")
+          params[:mapping_paths] = symbols_files
+        else
+          UI.message("No debug symbols found matching pattern: #{ENV['ANDROID_DEBUG_SYMBOLS_PATTERN']}")
+        end
+      end
+      upload_to_play_store(params)
+    end
+    
+  
+    def fetch_version()
+        aab_path = ENV['ANDROID_BUILD_FILE_PATH']
+        
+        version = sh(
+            command: "java -jar $(curl -sL -o bundletool.jar https://github.com/google/bundletool/releases/download/1.15.6/bundletool-all-1.15.6.jar && echo 'bundletool.jar') dump manifest --bundle=#{aab_path} | grep -oP 'android:versionName=\"\\K[^\"]*'",
+            error_callback: ->(result) { UI.user_error!("Failed to extract version from AAB: #{result}") }
+        ).strip
+        
+        if version.empty?
+            UI.user_error!("Version not found in AAB manifest")
+        end
+        
+        version
+    end
+
+    def fetch_version_code()
+        aab_path = ENV['ANDROID_BUILD_FILE_PATH']
+        
+        version_code = sh(
+            command: "java -jar $(curl -sL -o bundletool.jar https://github.com/google/bundletool/releases/download/1.15.6/bundletool-all-1.15.6.jar && echo 'bundletool.jar') dump manifest --bundle=#{aab_path} | grep -oP 'android:versionCode=\"\\K[^\"]*'",
+            error_callback: ->(result) { UI.user_error!("Failed to extract version code from AAB: #{result}") }
+        ).strip
+        
+        if version_code.empty?
+            UI.user_error!("Version code not found in AAB manifest")
+        end
+        
+        version_code
+    end
+
+    def android_get_changelog(version, use_default = false)
+      UI.message("Start android get changelog")
+      changelog_path = "#{ENV['GITHUB_WORKSPACE']}/fastlane/metadata/changelog.json"
+  
+      unless File.exist?(changelog_path)
+        UI.error("Changelog file not found at: #{changelog_path}")
+        return false
+      end
+      UI.success("Changelog file found at: #{changelog_path}")
+      
+      begin
+        file_content = File.read(changelog_path)
+        changelog = JSON.parse(file_content)
+        
+        content = if use_default
+          UI.success("Using default changelog as requested")
+          if changelog["default"]
+            UI.message("Default changelog found with languages: #{changelog['default'].keys.join(', ')}")
+            changelog["default"]
+          else
+            UI.important("Default changelog section not found")
+            empty_changelog
+          end
+        else
+          if changelog["versions"] && changelog["versions"]["n"]
+            UI.success("Using latest changelog from versions/n")
+            UI.message("Latest changelog contains languages: #{changelog['versions']['n'].keys.join(', ')}")
+            changelog["versions"]["n"]
+          else
+            UI.important("No suitable changelog found in versions/n, falling back to default")
+            UI.message("Attempting to use default changelog")
+            changelog["default"] || empty_changelog
+          end
+        end
+        
+        version_code = fetch_version_code()
+        content.each do |lang, text|
+          whatsnew_dir = "#{ENV['GITHUB_WORKSPACE']}/fastlane/metadata/android/#{lang}/changelogs"
+          FileUtils.mkdir_p(whatsnew_dir)
+          changelog_file = "#{whatsnew_dir}/#{version_code}.txt"
+          File.write(changelog_file, text)
+          UI.success("Successfully wrote changelog for language #{lang}")
+        end
+        
+        UI.success("Changelog processing completed successfully")
+        return true
+        
+      rescue JSON::ParserError => e
+        UI.error("Error parsing changelog JSON: #{e.message}")
+        UI.verbose("Full error details: #{e.backtrace.join("\n")}")
+        return false
+      rescue => e
+        UI.error("Unexpected error reading changelog: #{e.message}")
+        UI.verbose("Full error details: #{e.backtrace.join("\n")}")
+        return false
+      end
+    end
+end
+
+def get_latest_app_store_version
+  begin
+    UI.message("🔍 Fetching latest version from App Store Connect...")
+    
+    # Setup App Store Connect API key
+    app_store_connect_api_key(
+      key_id: ENV["APPSTORE_KEY_ID"],
+      issuer_id: ENV["APPSTORE_ISSUER_ID"],
+      key_content: ENV['APPSTORE_P8']
+    )
+    
+    # Use Fastlane's built-in action to get App Store build number and version
+    app_store_build_number(app_identifier: ENV['IOS_BUNDLE_ID'])
+    
+    # Get the version from lane context
+    latest_version = lane_context[SharedValues::LATEST_VERSION]
+    
+    if latest_version && !latest_version.empty?
+      UI.success("📱 Latest App Store version: #{latest_version}")
+      return latest_version
+    else
+      UI.important("⚠️  No live version found in App Store")
+      return nil
+    end
+    
+  rescue => e
+    UI.error("❌ Error fetching App Store version: #{e.message}")
+    UI.verbose("Full error details: #{e.backtrace.join("\n")}")
+    return nil
+  end
+end
+
+def calculate_final_version(git_based_version)
+  UI.message("🔄 Starting version calculation process...")
+  UI.message("📋 Git-based version: #{git_based_version}")
+  
+  # Get latest version from App Store
+  app_store_version = get_latest_app_store_version()
+  
+  if app_store_version.nil?
+    UI.message("📦 Using git-based version (no App Store version found): #{git_based_version}")
+    return git_based_version
+  end
+  
+  # Compare versions
+  if Gem::Version.new(git_based_version) > Gem::Version.new(app_store_version)
+    UI.success("✅ Git version (#{git_based_version}) > App Store version (#{app_store_version})")
+    UI.message("📦 Using git-based version: #{git_based_version}")
+    return git_based_version
+  else
+    # App Store version is higher or equal, increment it
+    UI.important("⚠️  App Store version (#{app_store_version}) >= Git version (#{git_based_version})")
+    
+    # Parse app store version and increment
+    version_parts = app_store_version.split(".")
+    major = version_parts[0].to_i
+    minor = version_parts[1].to_i
+    patch = version_parts[2] ? version_parts[2].to_i : 0
+    
+    # Increment patch version
+    patch += 1
+    new_version = "#{major}.#{minor}.#{patch}"
+    
+    UI.success("🔄 Incremented App Store version: #{app_store_version} → #{new_version}")
+    UI.message("📦 Using incremented version: #{new_version}")
+    return new_version
+  end
+end
+
+# Extract repository information from environment variables
+# These are used for GitHub Actions integration and match (code signing) repository
+org, repo = (ENV["GITHUB_REPOSITORY"]||"").split("/")
+match_org, match_repo = (ENV["MATCH_REPOSITORY"]||"").split("/")
+
+platform :ios do
+  # Facebook SDK Libraries Configuration
+  FACEBOOK_SDK_LIBRARIES = [
+    'FBSDKCoreKit', 
+    'FBSDKLoginKit', 
+    'FBSDKShareKit', 
+    'FBAEMKit', 
+    'FBSDKCoreKit_Basics',
+    'FBSDKGamingServicesKit'
+  ]
+
+  lane :init_ci do
+    github_action(
+      api_token: ENV["GH_PAT"],
+      org: org,
+      repo: repo,
+      match_org: match_org,
+      match_repo: match_repo,
+      writable_deploy_key: true
+    )
+  end
+
+  desc "Sync codesigning certificates"
+  lane :sync_certificates do
+    app_store_connect_api_key(
+      key_id: ENV["APPSTORE_KEY_ID"],
+      issuer_id: ENV["APPSTORE_ISSUER_ID"],
+      key_content: ENV['APPSTORE_P8']
+    )
+
+    match(
+      type: "appstore",
+      storage_mode: "git",
+      git_url: "git@github.com:#{match_org}/#{match_repo}.git",
+      app_identifier: [
+        ENV["IOS_BUNDLE_ID"],
+        "#{ENV['IOS_BUNDLE_ID']}.notificationservice" 
+      ],
+      readonly: false
+    )
+  end
+
+  desc "Deliver a new Release build to the App Store"
+  lane :release do
+    build
+    upload_to_app_store
+  end
+
+  desc "Deliver a new Beta build to Apple TestFlight"
+  lane :beta do |options|
+    
+    build
+
+    puts "Distribute external: #{options[:distribute_external]}"
+    puts "External group name: #{options[:external_group_name]}"
+    use_default_changelog = ENV['USE_DEFAULT_CHANGELOG']&.downcase == 'true'
+    changelog_hash  = ios_get_changelog('n', use_default_changelog)
+
+    if options[:distribute_external]
+      upload_to_testflight(
+        beta_app_description: "Test description",
+        localized_build_info: changelog_hash,
+        distribute_external: true,
+        groups: [options[:external_group_name]],
+        notify_external_testers: true
+      )
+    else
+      upload_to_testflight(
+        localized_build_info: changelog_hash,
+        skip_waiting_for_build_processing: true
+      )
+    end
+  end
+
+  desc "List available provisioning profiles"
+  lane :debug_profiles do
+    puts "Available Provisioning Profiles:"
+    sh("ls ~/Library/MobileDevice/Provisioning\\ Profiles || echo 'No profiles found'")
+  end
+
+  desc "Fix notificationservice Info.plist path in project.pbxproj"
+  lane :fix_infoplist_path do
+    project_path = "#{ENV['IOS_BUILD_PATH']}/iOS/Unity-iPhone.xcodeproj/project.pbxproj"
+    
+    sh <<-SHELL
+      sed -i '' 's|INFOPLIST_FILE = /github/workspace/build/iOS/iOS/notificationservice/Info.plist;|INFOPLIST_FILE = notificationservice/Info.plist;|' #{project_path}
+    SHELL
+  
+    puts "✅ INFOPLIST_FILE path updated to relative."
+  end
+
+  desc "Fix absolute paths in project.pbxproj"
+  lane :fix_absolute_paths do
+    project_path = "#{ENV['IOS_BUILD_PATH']}/iOS/Unity-iPhone.xcodeproj/project.pbxproj"
+  
+    sh <<-SHELL
+      sed -i '' 's|path = /github/workspace/build/iOS/iOS/notificationservice/|path = notificationservice/|g' #{project_path}
+      sed -i '' 's|path = /github/workspace/build/iOS/iOS/|path = |g' #{project_path}
+    SHELL
+  
+    puts "✅ All absolute paths updated to relative."
+  end
+  
+  desc "Debug Xcode paths"
+  lane :debug_xcode_paths do
+    plist_path = "#{ENV['IOS_BUILD_PATH']}/iOS/notificationservice/Info.plist"
+    puts "Plist Path: #{plist_path}"
+    puts "Project Path: #{ENV['IOS_BUILD_PATH']}/iOS/Unity-iPhone.xcodeproj/project.pbxproj"
+    sh("ls -la #{plist_path}")
+  end
+  desc "Create .ipa"
+  lane :build do
+    setup_ci
+
+    info_plist_path = "#{ENV['IOS_BUILD_PATH']}/iOS/Info.plist"
+    info_plist_content = File.open(info_plist_path, "r:bom|utf-8", &:read)
+    File.write(info_plist_path, info_plist_content)
+
+    xcodeproj_path = "#{ENV['IOS_BUILD_PATH']}/iOS/Unity-iPhone.xcodeproj"
+
+    app_store_connect_api_key(
+      key_id: ENV["APPSTORE_KEY_ID"],
+      issuer_id: ENV["APPSTORE_ISSUER_ID"],
+      key_content: ENV['APPSTORE_P8']
+    )
+
+    current_version = fetch_current_version(info_plist_path)
+    UI.message("🍏 Current version from Info.plist (set by Unity Builder): #{current_version}")
+
+    base_build_number = calculate_build_number(current_version)
+    UI.message("🔢 Base build number calculated: #{base_build_number}")
+    
+    latest_build_number = get_latest_build_number()
+    UI.message("📊 Latest build number in TestFlight: #{latest_build_number}")
+    
+    final_build_number = get_next_available_build_number(base_build_number, latest_build_number)
+    UI.success("🚀 Final build number to use: #{final_build_number}")
+
+    update_build_number_in_plist(xcodeproj_path, final_build_number)
+    sync_certificates
+    debug_profiles
+    debug_xcode_paths
+    
+    # === PRE-COCOAPODS COMPREHENSIVE LOGGING ===
+    UI.message("🍏 === PRE-COCOAPODS COMPREHENSIVE ANALYSIS ===")
+    build_dir = "#{ENV['IOS_BUILD_PATH']}/iOS"
+    UI.message("🍏 Build directory: #{build_dir}")
+    
+    # Log current directory structure
+    UI.message("📂 Current directory structure:")
+    sh("find #{build_dir} -maxdepth 3 -type f -name '*.plist' -o -name 'Podfile*' -o -name '*.xcodeproj' | head -20", log: false).split("\n").each do |file|
+      UI.message("  - #{file}")
+    end
+    
+    # Analyze Podfile in detail
+    podfile_path = "#{build_dir}/Podfile"
+    if File.exist?(podfile_path)
+      UI.success("✅ Podfile found at: #{podfile_path}")
+      podfile_content = File.read(podfile_path)
+      UI.message("📋 Complete Podfile contents:")
+      podfile_content.split("\n").each_with_index do |line, index|
+        UI.message("#{sprintf("%3d", index + 1)}: #{line}")
+      end
+      
+      # Check for Facebook SDK references
+      FACEBOOK_SDK_LIBRARIES.each do |lib|
+        if podfile_content.include?(lib)
+          UI.success("✅ #{lib} found in Podfile")
+        else
+          UI.important("⚠️ #{lib} NOT explicitly found in Podfile")
+        end
+      end
+      
+      # Check for other important dependencies
+      other_deps = ['AppLovinSDK', 'GoogleMobileAds', 'Firebase']
+      other_deps.each do |dep|
+        if podfile_content.include?(dep)
+          UI.success("✅ #{dep} found in Podfile")
+        else
+          UI.important("⚠️ #{dep} NOT explicitly found in Podfile")
+        end
+      end
+    else
+      UI.error("❌ Podfile not found at #{podfile_path}")
+    end
+    
+    # Check existing Pods directory
+    pods_dir = "#{build_dir}/Pods"
+    if Dir.exist?(pods_dir)
+      UI.message("📦 Existing Pods directory found - contents:")
+      Dir.glob("#{pods_dir}/*").each do |pod|
+        UI.message("  - #{File.basename(pod)}")
+      end
+    else
+      UI.message("📦 No existing Pods directory")
+    end
+    
+    # Check Podfile.lock
+    podfile_lock = "#{build_dir}/Podfile.lock"
+    if File.exist?(podfile_lock)
+      UI.success("✅ Podfile.lock exists")
+      lock_content = File.read(podfile_lock)
+      UI.message("🔒 Facebook SDK versions in Podfile.lock:")
+      FACEBOOK_SDK_LIBRARIES.each do |lib|
+        if match = lock_content.match(/#{lib}\s+\(([^)]+)\)/)
+          UI.message("  - #{lib}: #{match[1]}")
+        else
+          UI.message("  - #{lib}: NOT FOUND")
+        end
+      end
+    else
+      UI.message("🔒 No Podfile.lock found")
+    end
+    
+    # Check Unity project structure
+    UI.message("🎮 Unity project structure analysis:")
+    unity_files = Dir.glob("#{build_dir}/**/*.{h,m,mm,swift,plist}").select { |f| File.basename(f).include?('Unity') || File.basename(f).include?('Facebook') }
+    unity_files.first(10).each do |file|
+      UI.message("  - #{file.gsub(build_dir + '/', '')}")
+    end
+    
+    UI.message("🍏 === END PRE-COCOAPODS ANALYSIS ===")
+    
+    UI.message("🍏 === COCOAPODS INSTALLATION START ===")
+    UI.message("🍏 Installing CocoaPods dependencies...")
+    UI.message("🍏 Podfile path: #{ENV['IOS_BUILD_PATH']}/iOS/Podfile")
+    
+    cocoapods(
+      clean_install: true,
+      podfile: "#{ENV['IOS_BUILD_PATH']}/iOS/",
+      use_bundle_exec: false
+    )
+
+    # === POST-COCOAPODS FACEBOOK SDK COMPREHENSIVE VALIDATION ===
+    UI.message("🍏 === POST-COCOAPODS FACEBOOK SDK COMPREHENSIVE VALIDATION ===")
+    pods_dir = "#{ENV['IOS_BUILD_PATH']}/iOS/Pods"
+    
+    if Dir.exist?(pods_dir)
+      UI.success("✅ Pods directory created successfully at: #{pods_dir}")
+      
+      # Comprehensive Facebook SDK check
+      FACEBOOK_SDK_LIBRARIES.each do |sdk_name|
+        UI.message("🔍 === ANALYZING #{sdk_name} ===")
+        
+        # Check if pod directory exists
+        sdk_pod_dir = "#{pods_dir}/#{sdk_name}"
+        if Dir.exist?(sdk_pod_dir)
+          UI.success("✅ #{sdk_name} pod directory found")
+          
+          # List contents of pod directory
+          UI.message("📁 Contents of #{sdk_name} pod:")
+          Dir.glob("#{sdk_pod_dir}/**/*").each do |item|
+            relative_path = item.gsub(sdk_pod_dir + '/', '')
+            if File.directory?(item)
+              UI.message("  📁 #{relative_path}/")
+            else
+              UI.message("  📄 #{relative_path}")
+            end
+          end
+          
+          # Look for frameworks and xcframeworks
+          frameworks = Dir.glob("#{sdk_pod_dir}/**/*.framework")
+          xcframeworks = Dir.glob("#{sdk_pod_dir}/**/*.xcframework")
+          
+          if frameworks.any?
+            UI.success("🏗️ #{sdk_name} .framework files found:")
+            frameworks.each do |fw|
+              UI.message("  - #{fw.gsub(pods_dir + '/', '')}")
+              
+              # Check framework contents
+              if Dir.exist?(fw)
+                fw_contents = Dir.glob("#{fw}/*")
+                UI.message("    📋 Framework contents:")
+                fw_contents.each do |content|
+                  UI.message("      - #{File.basename(content)}")
+                end
+              end
+            end
+          end
+          
+          if xcframeworks.any?
+            UI.success("🏗️ #{sdk_name} .xcframework files found:")
+            xcframeworks.each do |fw|
+              UI.message("  - #{fw.gsub(pods_dir + '/', '')}")
+              
+              # Check xcframework contents
+              if Dir.exist?(fw)
+                fw_contents = Dir.glob("#{fw}/*")
+                UI.message("    📋 XCFramework contents:")
+                fw_contents.each do |content|
+                  UI.message("      - #{File.basename(content)}")
+                end
+              end
+            end
+          end
+          
+          if frameworks.empty? && xcframeworks.empty?
+            UI.error("❌ No .framework or .xcframework files found in #{sdk_name}")
+          end
+          
+          # Check for header files
+          headers = Dir.glob("#{sdk_pod_dir}/**/*.h")
+          if headers.any?
+            UI.message("📝 Header files in #{sdk_name}:")
+            headers.first(5).each do |header|
+              UI.message("  - #{header.gsub(sdk_pod_dir + '/', '')}")
+            end
+            UI.message("  ... and #{headers.count - 5} more") if headers.count > 5
+          end
+          
+        else
+          UI.error("❌ #{sdk_name} pod directory NOT FOUND at #{sdk_pod_dir}")
+        end
+        UI.message("🔍 === END #{sdk_name} ANALYSIS ===")
+      end
+      
+      # Check Podfile.lock for Facebook SDK versions
+      podfile_lock = "#{ENV['IOS_BUILD_PATH']}/iOS/Podfile.lock"
+      if File.exist?(podfile_lock)
+        UI.success("✅ Podfile.lock updated successfully")
+        lock_content = File.read(podfile_lock)
+        UI.message("🔒 Facebook SDK versions installed:")
+        FACEBOOK_SDK_LIBRARIES.each do |lib|
+          if match = lock_content.match(/#{lib}\s+\(([^)]+)\)/)
+            UI.success("  ✅ #{lib}: #{match[1]}")
+          else
+            UI.error("  ❌ #{lib}: NOT FOUND in Podfile.lock")
+          end
+        end
+        
+        # Check dependencies
+        UI.message("🔗 Facebook SDK dependencies:")
+        if match = lock_content.match(/DEPENDENCIES:(.*?)SPEC/m)
+          dependencies = match[1]
+          FACEBOOK_SDK_LIBRARIES.each do |lib|
+            if dependencies.include?(lib)
+              UI.success("  ✅ #{lib} listed in DEPENDENCIES")
+            else
+              UI.error("  ❌ #{lib} NOT in DEPENDENCIES")
+            end
+          end
+        end
+      else
+        UI.error("❌ Podfile.lock not found after CocoaPods installation")
+      end
+      
+      # Summary of all pods installed
+      UI.message("📦 Complete list of installed pods:")
+              all_pods = Dir.glob("#{pods_dir}/*").select { |f| File.directory?(f) && File.basename(f) != 'Target Support Files' }
+        all_pods.each do |pod|
+          pod_name = File.basename(pod)
+          if FACEBOOK_SDK_LIBRARIES.include?(pod_name)
+          UI.success("  ✅ #{pod_name} (Facebook SDK)")
+        else
+          UI.message("  📦 #{pod_name}")
+        end
+      end
+      
+    else
+      UI.error("❌ Pods directory not created at #{pods_dir}")
+      UI.error("❌ CocoaPods installation may have failed!")
+    end
+    
+    UI.message("🍏 === END FACEBOOK SDK COMPREHENSIVE VALIDATION ===")
+
+    require 'xcodeproj'
+    project_path = "#{ENV['IOS_BUILD_PATH']}/iOS/Unity-iPhone.xcodeproj"
+    project = Xcodeproj::Project.open(project_path)
+    main_target = project.targets.find { |t| t.name == 'Unity-iPhone' }
+    
+    # Initialize embed phase once
+    embed_phase = main_target.copy_files_build_phases.find { |ph| ph.name == 'Embed Frameworks' }
+    embed_phase ||= main_target.new_copy_files_build_phase('Embed Frameworks')
+    
+    # Track already added frameworks to avoid duplicates
+    existing_frameworks = main_target.frameworks_build_phase.files.map { |file| File.basename(file.file_ref.path) }
+
+    UI.message "🔍 Adding Facebook SDK frameworks to Xcode project"
+    FACEBOOK_SDK_LIBRARIES.each do |sdk_name|
+      # Prefer xcframework over framework
+      fw_path = Dir.glob("#{ENV['IOS_BUILD_PATH']}/iOS/Pods/#{sdk_name}/**/*.xcframework").first ||
+                Dir.glob("#{ENV['IOS_BUILD_PATH']}/iOS/Pods/#{sdk_name}/**/*.framework").first
+
+      if fw_path && File.exist?(fw_path)
+        rel_path = fw_path.sub("#{ENV['IOS_BUILD_PATH']}/iOS/","")
+        framework_name = File.basename(fw_path)
+        
+        # Check if framework is already added
+        if existing_frameworks.include?(framework_name)
+          UI.important "⚠️ #{sdk_name} (#{framework_name}) already exists in project, skipping"
+        else
+          UI.success "✅ Found #{sdk_name} at: #{rel_path}"
+          file_ref = project.new_file(rel_path)
+          main_target.frameworks_build_phase.add_file_reference(file_ref)
+          embed_phase.add_file_reference(file_ref)
+          existing_frameworks << framework_name
+        end
+      else
+        UI.error "❌ #{sdk_name} framework not found in Pods"
+      end
+    end
+
+    UI.message "🔍 CHECKING ADDITIONAL FRAMEWORKS STRUCTURE"
+    
+    # Define framework search patterns
+    additional_frameworks = [
+      { name: 'AppLovinSDK', patterns: ['*AppLovinSDK*.xcframework', '*AppLovinSDK*.framework'] },
+      { name: 'MolocoSDK', patterns: ['*MolocoSDK*.xcframework', '*MolocoSDK*.framework'] },
+      { name: 'OMSDK', patterns: ['*OMSDK*.xcframework', '*OMSDK*.framework'] }
+    ]
+
+    additional_frameworks.each do |fw_info|
+      UI.message "🔍 Searching for #{fw_info[:name]}"
+      fw_path = nil
+      
+      # Search for framework with preference for xcframework
+      fw_info[:patterns].each do |pattern|
+        found_paths = sh("find #{ENV['IOS_BUILD_PATH']}/iOS/Pods -name '#{pattern}' -type d", log: false).strip.split("\n")
+        unless found_paths.empty? || found_paths.first.empty?
+          fw_path = found_paths.first
+          break
+        end
+      end
+      
+      if fw_path && !fw_path.empty? && File.exist?(fw_path)
+        relative_path = fw_path.gsub("#{ENV['IOS_BUILD_PATH']}/iOS/", "")
+        framework_name = File.basename(fw_path)
+        
+        # Check if framework is already added
+        if existing_frameworks.include?(framework_name)
+          UI.important "⚠️ #{fw_info[:name]} (#{framework_name}) already exists in project, skipping"
+        else
+          UI.success "✅ Adding #{fw_info[:name]} at: #{relative_path}"
+          file_ref = project.new_file(relative_path)
+          main_target.frameworks_build_phase.add_file_reference(file_ref)
+          embed_phase.add_file_reference(file_ref)
+          existing_frameworks << framework_name
+        end
+      else
+        UI.error "❌ #{fw_info[:name]} not found!"
+      end
+    end
+
+    project.save
+    UI.success "🔧 All frameworks added to Xcode project!"
+    
+    # Post-CocoaPods validation
+    UI.message("🍏 === POST-COCOAPODS APPLOVIN VALIDATION ===")
+    pods_dir = "#{ENV['IOS_BUILD_PATH']}/iOS/Pods"
+    if Dir.exist?(pods_dir)
+      UI.success("✅ Pods directory created successfully")
+      
+      # Check for AppLovin pods
+      applovin_pods = Dir.glob("#{pods_dir}/*AppLovin*")
+      if applovin_pods.any?
+        UI.success("✅ AppLovin pods found:")
+        applovin_pods.each { |pod| UI.message("  - #{File.basename(pod)}") }
+        
+        # Check for AppLovin frameworks
+        applovin_pods.each do |pod_dir|
+          frameworks = Dir.glob("#{pod_dir}/**/*.framework")
+          xcframeworks = Dir.glob("#{pod_dir}/**/*.xcframework")
+          
+          UI.message("📦 Frameworks in #{File.basename(pod_dir)}:")
+          frameworks.each { |fw| UI.message("  - #{File.basename(fw)}") }
+          xcframeworks.each { |fw| UI.message("  - #{File.basename(fw)}") }
+        end
+      else
+        UI.error("❌ NO AppLovin pods found in #{pods_dir}")
+        UI.message("📂 Available pods:")
+        Dir.glob("#{pods_dir}/*").each { |pod| UI.message("  - #{File.basename(pod)}") }
+      end
+    else
+      UI.error("❌ Pods directory not created at #{pods_dir}")
+    end
+    
+    UI.message("🍏 === COCOAPODS INSTALLATION COMPLETE ===")
+
+    update_info_plist(
+      xcodeproj: xcodeproj_path,
+      plist_path: 'notificationservice/Info.plist',
+      block: lambda { |plist|
+        plist["CFBundleVersion"] = final_build_number.to_s
+      }
+    )
+
+    # Unity has specific requirements around codesigning that we have to handle
+    # See https://github.com/fastlane/fastlane/discussions/17458 for context
+    update_code_signing_settings(
+      use_automatic_signing: true,
+      path: xcodeproj_path
+    )
+
+    ios_bundle_id = ENV['IOS_BUNDLE_ID']
+    team_id = ENV["sigh_#{ios_bundle_id}_appstore_team-id"]
+    profile_name = ENV["sigh_#{ios_bundle_id}_appstore_profile-name"]
+    profile_uuid = ENV["sigh_#{ios_bundle_id}_appstore"]
+    notification_service_profile_name = ENV["sigh_#{ios_bundle_id}.notificationservice_appstore_profile-name"]
+    notification_service_profile_uuid = ENV["sigh_#{ios_bundle_id}.notificationservice_appstore"]
+
+    code_sign_identity = 'iPhone Distribution'
+
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      team_id: team_id,
+      code_sign_identity: code_sign_identity,
+      targets: 'Unity-iPhone',
+      path: xcodeproj_path,
+      profile_name: profile_name,
+      profile_uuid: profile_uuid
+    )
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      team_id: team_id,
+      code_sign_identity: code_sign_identity,
+      targets: "notificationservice", 
+      path: xcodeproj_path,
+      profile_name: notification_service_profile_name,
+      profile_uuid: notification_service_profile_uuid
+    )
+
+    puts "AppStore profile name: #{profile_name}"
+    puts "AppStore profile UUID: #{profile_uuid}"
+    puts "NotificationService profile name: #{notification_service_profile_name}"
+    puts "NotificationService profile UUID: #{notification_service_profile_uuid}"
+    
+    fix_infoplist_path
+    fix_absolute_paths
+    
+    UI.message("🍏 === XCODE BUILD START ===")
+    workspace_path = "#{ENV['IOS_BUILD_PATH']}/iOS/Unity-iPhone.xcworkspace"
+    UI.message("🍏 Building workspace: #{workspace_path}")
+    
+    # Pre-build validation
+    if File.exist?(workspace_path)
+      UI.success("✅ Xcode workspace found")
+    else
+      UI.error("❌ Xcode workspace not found at #{workspace_path}")
+    end
+    
+    # Check for AppLovin in workspace
+    workspace_dir = File.dirname(workspace_path)
+    if Dir.exist?("#{workspace_dir}/Pods")
+      applovin_frameworks = Dir.glob("#{workspace_dir}/Pods/**/AppLovinSDK.{framework,xcframework}")
+      if applovin_frameworks.any?
+        UI.success("✅ AppLovin frameworks found in workspace:")
+        applovin_frameworks.each { |fw| UI.message("  - #{fw}") }
+      else
+        UI.error("❌ AppLovin frameworks NOT found in workspace Pods")
+      end
+    end
+    
+    build_app(
+      workspace: workspace_path,
+      scheme: 'Unity-iPhone',
+      xcargs: '-allowProvisioningUpdates',
+      include_symbols: ENV['EXPORT_DEBUG_SYMBOLS'] == 'true',
+      export_options: {
+        provisioningProfiles: {
+          ENV["IOS_BUNDLE_ID"] => ENV["sigh_#{ios_bundle_id}_appstore_profile-name"], 
+          "#{ENV['IOS_BUNDLE_ID']}.notificationservice" => ENV["sigh_#{ios_bundle_id}.notificationservice_appstore_profile-name"] 
+        }
+      }
+    )
+    
+    # Post-build validation - check if AppLovin is in the final IPA
+    UI.message("🍏 === POST-BUILD APPLOVIN VALIDATION ===")
+    ipa_path = Actions.lane_context[SharedValues::IPA_OUTPUT_PATH]
+    if ipa_path && File.exist?(ipa_path)
+      UI.success("✅ IPA created successfully: #{ipa_path}")
+      
+      # Extract and examine IPA contents for AppLovin
+      UI.message("🔍 Extracting IPA to check for AppLovin frameworks...")
+      temp_dir = "/tmp/ipa_extract_#{Time.now.to_i}"
+      sh("mkdir -p #{temp_dir}")
+      sh("cd #{temp_dir} && unzip -q '#{ipa_path}'")
+      
+      app_dir = Dir.glob("#{temp_dir}/Payload/*.app").first
+      if app_dir
+        UI.message("📱 App bundle found: #{File.basename(app_dir)}")
+        
+        # Check for AppLovin in Frameworks
+        frameworks_dir = "#{app_dir}/Frameworks"
+        if Dir.exist?(frameworks_dir)
+          UI.success("✅ Frameworks directory found in app bundle")
+          frameworks = Dir.glob("#{frameworks_dir}/*")
+          UI.message("📦 Frameworks in app bundle:")
+          frameworks.each { |fw| UI.message("  - #{File.basename(fw)}") }
+          
+          applovin_frameworks = frameworks.select { |fw| File.basename(fw).include?("AppLovin") }
+          if applovin_frameworks.any?
+            UI.success("✅ AppLovin frameworks found in final app bundle:")
+            applovin_frameworks.each { |fw| UI.message("  - #{File.basename(fw)}") }
+            
+            # Check framework contents
+            applovin_frameworks.each do |fw|
+              if Dir.exist?(fw)
+                contents = Dir.glob("#{fw}/*")
+                UI.message("📋 Contents of #{File.basename(fw)}:")
+                contents.each { |item| UI.message("    - #{File.basename(item)}") }
+              end
+            end
+          else
+            UI.error("❌ AppLovin frameworks NOT FOUND in final app bundle!")
+            UI.error("This explains why the app crashes with 'Library not loaded: @rpath/AppLovinSDK.framework/AppLovinSDK'")
+          end
+        else
+          UI.error("❌ Frameworks directory not found in app bundle")
+        end
+        
+        # Check Info.plist for AppLovin settings
+        info_plist = "#{app_dir}/Info.plist"
+        if File.exist?(info_plist)
+          plist_content = sh("plutil -p '#{info_plist}'")
+          if plist_content.include?("GADApplicationIdentifier")
+            UI.success("✅ GADApplicationIdentifier found in final Info.plist")
+          else
+            UI.important("⚠️ GADApplicationIdentifier NOT found in final Info.plist")
+          end
+        end
+      end
+      
+      # Cleanup
+      sh("rm -rf #{temp_dir}")
+    else
+      UI.error("❌ IPA not created or not found")
+    end
+    
+    # === POST-BUILD FACEBOOK SDK VALIDATION IN FINAL IPA ===
+    UI.message("🍏 === POST-BUILD FACEBOOK SDK VALIDATION ===")
+    if ipa_path && File.exist?(ipa_path)
+      UI.message("🔍 Extracting IPA to check for Facebook SDK frameworks...")
+      temp_dir = "/tmp/fb_ipa_extract_#{Time.now.to_i}"
+      sh("mkdir -p #{temp_dir}")
+      sh("cd #{temp_dir} && unzip -q '#{ipa_path}'")
+      
+      app_dir = Dir.glob("#{temp_dir}/Payload/*.app").first
+      if app_dir
+        UI.message("📱 Analyzing app bundle for Facebook SDK: #{File.basename(app_dir)}")
+        
+        # Check for Facebook SDK in Frameworks
+        frameworks_dir = "#{app_dir}/Frameworks"
+        if Dir.exist?(frameworks_dir)
+          frameworks = Dir.glob("#{frameworks_dir}/*")
+          
+          fb_frameworks_found = []
+          
+          FACEBOOK_SDK_LIBRARIES.each do |fb_lib|
+            fb_frameworks = frameworks.select { |fw| File.basename(fw).include?(fb_lib) }
+            if fb_frameworks.any?
+              UI.success("✅ #{fb_lib} framework found in final app bundle:")
+              fb_frameworks.each do |fw|
+                UI.message("  - #{File.basename(fw)}")
+                fb_frameworks_found << fb_lib
+                
+                # Check framework contents
+                if Dir.exist?(fw)
+                  contents = Dir.glob("#{fw}/*")
+                  UI.message("    📋 Framework contents:")
+                  contents.first(5).each { |item| UI.message("      - #{File.basename(item)}") }
+                  UI.message("      ... and #{contents.count - 5} more files") if contents.count > 5
+                end
+              end
+            else
+              UI.error("❌ #{fb_lib} framework NOT FOUND in final app bundle!")
+            end
+          end
+          
+          # Summary
+          if fb_frameworks_found.count == FACEBOOK_SDK_LIBRARIES.count
+            UI.success("🎉 ALL Facebook SDK frameworks successfully included in app bundle!")
+          else
+            UI.error("❌ Only #{fb_frameworks_found.count}/#{FACEBOOK_SDK_LIBRARIES.count} Facebook SDK frameworks found")
+            UI.error("Missing: #{(FACEBOOK_SDK_LIBRARIES - fb_frameworks_found).join(', ')}")
+          end
+        else
+          UI.error("❌ Frameworks directory not found in app bundle")
+        end
+      end
+      
+      # Cleanup
+      sh("rm -rf #{temp_dir}")
+    end
+    UI.message("🍏 === END FACEBOOK SDK VALIDATION ===")
+    
+    UI.message("🍏 === XCODE BUILD COMPLETE ===")
+
+    sh("echo \"version=#{current_version}\" >> $GITHUB_OUTPUT")
+    sh("echo \"build_number=#{final_build_number}\" >> $GITHUB_OUTPUT")
+  end
+
+
+  def fetch_current_version(info_plist_path)
+    get_info_plist_value(
+      path: info_plist_path,
+      key: "CFBundleShortVersionString"
+    )
+  end
+
+  def get_latest_build_number
+    latest_build = latest_testflight_build_number(
+      app_identifier: ENV['IOS_BUNDLE_ID']
+    )
+    latest_build
+  end
+
+
+  def update_build_number_in_plist(xcodeproj_path, build_number)
+    update_info_plist(
+      xcodeproj: xcodeproj_path,
+      plist_path: 'Info.plist',
+      block: lambda { |plist|
+        plist["CFBundleVersion"] = build_number.to_s
+      }
+    )
+  end
+
+  def ios_get_changelog(version, use_default = false)
+    UI.message("Start ios get changelog")
+    changelog_path = "#{ENV['GITHUB_WORKSPACE']}/fastlane/metadata/changelog.json"
+
+    unless File.exist?(changelog_path)
+      UI.error("Changelog file not found at: #{changelog_path}")
+      return nil
+    end
+
+    UI.success("Processing changelog at: #{changelog_path}")
+
+    begin
+      changelog_data = JSON.parse(File.read(changelog_path))
+      content = if use_default
+        UI.message("Using default changelog")
+        changelog_data["default"]
+      else 
+        UI.message("Using version changelog")
+        changelog_data.dig("versions", "n") || changelog_data["default"]
+      end
+
+      return nil unless content
+
+      localized_changelog = {}
+      content.each do |lang, text|
+        localized_changelog[lang] = { whats_new: text }
+      end
+
+      UI.success("Generated changelog for: #{localized_changelog.keys.join(', ')}")
+      return localized_changelog
+
+    rescue JSON::ParserError => e
+      UI.error("Error parsing changelog JSON: #{e.message}")
+      return nil
+    rescue => e
+      UI.error("Unexpected error reading changelog: #{e.message}")
+      return nil
+    end
+  end
+  
+end

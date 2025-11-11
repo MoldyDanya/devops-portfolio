@@ -1,0 +1,13 @@
+{
+    "default": {
+        "en-US": "- Bug fixes and improvements"
+    },
+    "versions": {
+        "n": {
+            "en-US": "- Bug fixes"
+        },
+        "1.0.0": {
+            "en-US": "- Example version changelog"
+        }
+    }
+}
