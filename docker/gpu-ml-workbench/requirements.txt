@@ -1,0 +1,14 @@
+scikit-learn
+opencv-python
+cupy-cuda12x
+aiohttp
+aiomoex
+finam_trade_api
+keras
+matplotlib
+pandas
+Pillow
+python_dateutil
+pytz
+Requests
+tqdm
