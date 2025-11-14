@@ -1,0 +1,20 @@
+[Unit]
+Description=GitHub Runner Lifecycle Monitoring Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/bin/bash /usr/local/bin/runner-lifecycle-monitor.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment variables (optional, can be set in config.json instead)
+#Environment="RUNNER_DIR=/opt/actions-runner"
+#Environment="IDLE_TIMEOUT=30"
+#Environment="CHECK_INTERVAL=60"
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,46 @@
+{
+  "metrics": {
+    "namespace": "GitHub/Runners",
+    "metrics_collected": {
+      "statsd": {
+        "service_address": ":8125",
+        "metrics_collection_interval": 60,
+        "metrics_aggregation_interval": 60
+      }
+    },
+    "append_dimensions": {
+      "InstanceId": "${aws:InstanceId}",
+      "RunnerName": "${RUNNER_NAME}"
+    }
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/github-runner/lifecycle.log",
+            "log_group_name": "/github/runner/lifecycle",
+            "log_stream_name": "{instance_id}",
+            "retention_in_days": 14,
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/var/log/github-runner/hooks.log",
+            "log_group_name": "/github/runner/hooks",
+            "log_stream_name": "{instance_id}",
+            "retention_in_days": 7,
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/opt/actions-runner/_diag/Runner_*.log",
+            "log_group_name": "/github/runner/diagnostic",
+            "log_stream_name": "{instance_id}",
+            "retention_in_days": 14,
+            "timezone": "UTC"
+          }
+        ]
+      }
+    }
+  }
+}
+

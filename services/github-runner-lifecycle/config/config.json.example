@@ -1,0 +1,12 @@
+{
+  "IDLE_TIMEOUT": 30,
+  "CHECK_INTERVAL": 60,
+  "RUNNER_NAME": "github-runner-01",
+  "PROVIDER": "generic",
+  "RUNNER_DIR": "/opt/actions-runner",
+  "STOP_COMMAND": "",
+  "EVENT_HOOK_SCRIPT": "",
+  "INSTANCE_ID": "",
+  "REGION": "",
+  "SNS_TOPIC_ARN": ""
+}

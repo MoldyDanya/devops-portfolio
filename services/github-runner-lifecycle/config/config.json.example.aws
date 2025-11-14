@@ -1,0 +1,11 @@
+{
+  "IDLE_TIMEOUT": 30,
+  "CHECK_INTERVAL": 60,
+  "RUNNER_NAME": "github-runner-01",
+  "PROVIDER": "aws",
+  "RUNNER_DIR": "/opt/actions-runner",
+  "SNS_TOPIC_ARN": "arn:aws:sns:us-east-1:123456789012:github-runner-events",
+  "INSTANCE_ID": "",
+  "REGION": ""
+}
+
